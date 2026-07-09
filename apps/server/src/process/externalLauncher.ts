@@ -266,7 +266,7 @@ const buildAvailableEditors = Effect.fn("externalLauncher.buildAvailableEditors"
 ): Effect.fn.Return<ReadonlyArray<EditorId>, never, FileSystem.FileSystem | Path.Path> {
   const available: EditorId[] = [];
 
-  for (const editor of EDITORS) {
+  for (const editor of EDITORS.filter((editor) => editor.id === "vscode")) {
     if (editor.commands === null) {
       const command = fileManagerCommandForPlatform(platform);
       if (yield* isCommandAvailable(command, { env })) {
