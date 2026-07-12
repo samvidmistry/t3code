@@ -19,7 +19,7 @@ import { buildEnvironmentAuthHeaders, withEnvironmentCredentials } from "./envir
 // Bounded so a pathologically slow endpoint cannot block the (cheaper) socket
 // fallback for long. The cached thread renders while this runs, so the wait only
 // delays the transition to live data on the first open, not the initial paint.
-const DEFAULT_THREAD_SNAPSHOT_TIMEOUT_MS = 6_000;
+const DEFAULT_THREAD_SNAPSHOT_TIMEOUT_MS = 120_000;
 
 /**
  * Load a thread's detail snapshot over HTTP instead of embedding it in the
