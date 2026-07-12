@@ -1826,8 +1826,9 @@ function buildToolCallExpandedBody(
   workspaceRoot: string | undefined,
 ): string | null {
   const blocks: string[] = [];
-  if (workEntry.itemType === "mcp_tool_call" && workEntry.toolData !== undefined) {
-    blocks.push(`MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
+  if (workEntry.toolData !== undefined) {
+    const label = workEntry.itemType === "mcp_tool_call" ? "MCP call" : "Provider details";
+    blocks.push(`${label}\n${JSON.stringify(workEntry.toolData, null, 2)}`);
   }
   const raw = workEntryRawCommand(workEntry);
   if (raw?.trim()) {
@@ -1847,6 +1848,16 @@ function buildToolCallExpandedBody(
     );
   }
   return blocks.length > 0 ? blocks.join("\n\n") : null;
+}
+
+function workEntryCanExpand(workEntry: TimelineWorkEntry): boolean {
+  return Boolean(
+    workEntry.toolData !== undefined ||
+    workEntry.rawCommand?.trim() ||
+    workEntry.command?.trim() ||
+    workEntry.detail?.trim() ||
+    (workEntry.changedFiles?.length ?? 0) > 0,
+  );
 }
 
 function workEntryIconName(workEntry: TimelineWorkEntry): WorkEntryIconName {
@@ -1916,8 +1927,8 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
       ? null
       : rawPreview;
   const displayText = preview ? `${heading} - ${preview}` : heading;
-  const expandedBody = buildToolCallExpandedBody(workEntry, workspaceRoot);
-  const canExpand = expandedBody !== null;
+  const canExpand = workEntryCanExpand(workEntry);
+  const expandedBody = expanded ? buildToolCallExpandedBody(workEntry, workspaceRoot) : null;
   const showFailedIndicator = workEntryIndicatesToolFailure(workEntry);
   const showDestructiveRowStyle =
     showFailedIndicator &&

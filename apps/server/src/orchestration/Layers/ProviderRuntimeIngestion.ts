@@ -2,6 +2,7 @@ import {
   ApprovalRequestId,
   type AssistantDeliveryMode,
   CommandId,
+  EventId,
   MessageId,
   type OrchestrationEvent,
   type OrchestrationMessage,
@@ -53,6 +54,9 @@ const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY = 20_000;
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL = Duration.minutes(120);
 const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
 const BUFFERED_PROPOSED_PLAN_BY_ID_TTL = Duration.minutes(120);
+const REASONING_TEXT_BY_ITEM_CACHE_CAPACITY = 20_000;
+const REASONING_TEXT_BY_ITEM_TTL = Duration.minutes(120);
+const MAX_REASONING_ACTIVITY_CHARS = 24_000;
 const MAX_BUFFERED_ASSISTANT_CHARS = 24_000;
 const STRICT_PROVIDER_LIFECYCLE_GUARD = process.env.T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD !== "0";
 
@@ -164,6 +168,21 @@ function maxCheckpointTurnCount(
 
 function truncateDetail(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 3)}...` : value;
+}
+
+function reasoningPreview(value: string): string {
+  const lines = value.trim().split(/\r?\n/u);
+  return truncateDetail(
+    lines.findLast((line) => line.trim().length > 0)?.trim() ?? value.trim(),
+    120,
+  );
+}
+
+function boundReasoningText(value: string): string {
+  if (value.length <= MAX_REASONING_ACTIVITY_CHARS) {
+    return value;
+  }
+  return `[Earlier reasoning omitted]\n${value.slice(-MAX_REASONING_ACTIVITY_CHARS)}`;
 }
 
 function normalizeProposedPlanMarkdown(planMarkdown: string | undefined): string | undefined {
@@ -487,6 +506,34 @@ function runtimeEventToActivities(
       ];
     }
 
+    case "content.delta": {
+      if (
+        event.payload.streamKind !== "reasoning_text" &&
+        event.payload.streamKind !== "reasoning_summary_text"
+      ) {
+        return [];
+      }
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "task.progress",
+          summary:
+            event.payload.streamKind === "reasoning_summary_text"
+              ? "Reasoning summary"
+              : "Reasoning update",
+          payload: {
+            taskId: event.itemId ?? event.turnId ?? event.eventId,
+            detail: event.payload.delta,
+            summary: reasoningPreview(event.payload.delta),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "task.completed": {
       return [
         {
@@ -567,6 +614,7 @@ function runtimeEventToActivities(
           summary: event.payload.title ?? "Tool updated",
           payload: {
             itemType: event.payload.itemType,
+            ...(event.payload.title ? { title: event.payload.title } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
@@ -590,6 +638,8 @@ function runtimeEventToActivities(
           summary: event.payload.title ?? "Tool",
           payload: {
             itemType: event.payload.itemType,
+            ...(event.payload.title ? { title: event.payload.title } : {}),
+            ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
           },
@@ -612,7 +662,10 @@ function runtimeEventToActivities(
           summary: `${event.payload.title ?? "Tool"} started`,
           payload: {
             itemType: event.payload.itemType,
+            ...(event.payload.title ? { title: event.payload.title } : {}),
+            ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
+            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -648,6 +701,11 @@ const make = Effect.gen(function* () {
   const bufferedAssistantTextByMessageId = yield* Cache.make<MessageId, string>({
     capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
     timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
+    lookup: () => Effect.succeed(""),
+  });
+  const reasoningTextByItemKey = yield* Cache.make<string, string>({
+    capacity: REASONING_TEXT_BY_ITEM_CACHE_CAPACITY,
+    timeToLive: REASONING_TEXT_BY_ITEM_TTL,
     lookup: () => Effect.succeed(""),
   });
 
@@ -1365,6 +1423,43 @@ const make = Effect.gen(function* () {
       const proposedPlanDelta =
         event.type === "turn.proposed.delta" ? event.payload.delta : undefined;
 
+      let activitiesEvent = event;
+      if (
+        event.type === "content.delta" &&
+        (event.payload.streamKind === "reasoning_text" ||
+          event.payload.streamKind === "reasoning_summary_text") &&
+        event.payload.delta.length > 0
+      ) {
+        const reasoningKey = `${thread.id}:${event.turnId ?? ""}:${event.itemId ?? event.payload.streamKind}`;
+        const activityId = EventId.make(`reasoning:${reasoningKey}`);
+        const cached = yield* Cache.getOption(reasoningTextByItemKey, reasoningKey);
+        if (Option.isNone(cached)) {
+          yield* getLoadedThreadDetail();
+        }
+        const existing = loadedThreadDetail?.activities.find(
+          (activity) => activity.id === activityId,
+        );
+        const existingDetail =
+          existing && typeof existing.payload === "object" && existing.payload
+            ? (existing.payload as { detail?: unknown }).detail
+            : undefined;
+        const previous = Option.isSome(cached)
+          ? cached.value
+          : typeof existingDetail === "string"
+            ? existingDetail
+            : "";
+        const text = boundReasoningText(previous + event.payload.delta);
+        yield* Cache.set(reasoningTextByItemKey, reasoningKey, text);
+        activitiesEvent = {
+          ...event,
+          eventId: activityId,
+          payload: {
+            ...event.payload,
+            delta: text,
+          },
+        };
+      }
+
       if (assistantDelta && assistantDelta.length > 0) {
         const turnId = toTurnId(event.turnId);
         const assistantMessageId = yield* getOrCreateAssistantMessageId({
@@ -1654,7 +1749,7 @@ const make = Effect.gen(function* () {
         }
       }
 
-      const activities = runtimeEventToActivities(event);
+      const activities = runtimeEventToActivities(activitiesEvent);
       yield* Effect.forEach(activities, (activity) =>
         providerCommandId(event, "thread-activity-append").pipe(
           Effect.flatMap((commandId) =>

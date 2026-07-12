@@ -7,6 +7,7 @@ import {
   type ProviderSession,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
   type ToolLifecycleItemType,
   TurnId,
@@ -59,6 +60,7 @@ const PROVIDER = ProviderDriverKind.make("opencode");
  * rather than misread (mirrors GROK_RESUME_VERSION / CURSOR_RESUME_VERSION).
  */
 const OPENCODE_RESUME_VERSION = 1 as const;
+const MIN_REASONING_DELTA_CHARS = 256;
 
 /**
  * Decode a persisted OpenCode resume cursor back into the upstream `ses_…`
@@ -161,7 +163,11 @@ interface OpenCodeSessionContext {
   readonly messageRoleById: Map<string, "user" | "assistant">;
   readonly partById: Map<string, Part>;
   readonly emittedTextByPartId: Map<string, string>;
+  readonly observedReasoningTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
+  readonly emittedSubtaskPartIds: Set<string>;
+  readonly emittedAgentPartIds: Set<string>;
+  readonly emittedCompactionKeys: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
@@ -437,6 +443,58 @@ function detailFromToolPart(part: Extract<Part, { type: "tool" }>): string | und
   }
 }
 
+function toolPartTitle(part: Extract<Part, { type: "tool" }>): string {
+  return part.state.status === "running" || part.state.status === "completed"
+    ? (part.state.title ?? part.tool)
+    : part.tool;
+}
+
+function toolPartData(part: Extract<Part, { type: "tool" }>): Record<string, unknown> {
+  const item = {
+    id: part.id,
+    type: part.type,
+    callID: part.callID,
+    tool: part.tool,
+    ...(part.metadata ? { metadata: part.metadata } : {}),
+  };
+  switch (part.state.status) {
+    case "completed": {
+      const { output, ...state } = part.state;
+      return {
+        toolCallId: part.callID,
+        tool: part.tool,
+        kind: part.tool,
+        rawInput: part.state.input,
+        rawOutput: { content: output },
+        item: { ...item, state },
+      };
+    }
+    case "error": {
+      const { error, ...state } = part.state;
+      return {
+        toolCallId: part.callID,
+        tool: part.tool,
+        kind: part.tool,
+        rawInput: part.state.input,
+        rawOutput: { stderr: error },
+        item: { ...item, state },
+      };
+    }
+    default:
+      return {
+        toolCallId: part.callID,
+        tool: part.tool,
+        kind: part.tool,
+        rawInput: part.state.input,
+        item: { ...item, state: part.state },
+      };
+  }
+}
+
+function compactionKey(turnId: TurnId | undefined): string {
+  return turnId ?? "session";
+}
+
 function toolStateCreatedAt(part: Extract<Part, { type: "tool" }>): string | undefined {
   switch (part.state.status) {
     case "running":
@@ -671,9 +729,16 @@ export function makeOpenCodeAdapter(
       if (text === undefined) {
         return;
       }
-      const previousText = context.emittedTextByPartId.get(part.id);
-      const { latestText, deltaToEmit } = mergeOpenCodeAssistantText(previousText, text);
-      context.emittedTextByPartId.set(part.id, latestText);
+      const emittedText = context.emittedTextByPartId.get(part.id);
+      const previousText =
+        part.type === "reasoning"
+          ? context.observedReasoningTextByPartId.get(part.id)
+          : emittedText;
+      const { latestText } = mergeOpenCodeAssistantText(previousText, text);
+      const deltaToEmit = latestText.slice(commonPrefixLength(emittedText ?? "", latestText));
+      if (part.type === "reasoning") {
+        context.observedReasoningTextByPartId.set(part.id, latestText);
+      }
       if (latestText !== text) {
         context.partById.set(
           part.id,
@@ -682,7 +747,13 @@ export function makeOpenCodeAdapter(
             : part) satisfies Part,
         );
       }
-      if (deltaToEmit.length > 0) {
+      const shouldEmitDelta =
+        deltaToEmit.length > 0 &&
+        (part.type !== "reasoning" ||
+          part.time.end !== undefined ||
+          deltaToEmit.length >= MIN_REASONING_DELTA_CHARS);
+      if (shouldEmitDelta) {
+        context.emittedTextByPartId.set(part.id, latestText);
         yield* emit({
           ...(yield* buildEventBase({
             threadId: context.session.threadId,
@@ -769,6 +840,14 @@ export function makeOpenCodeAdapter(
           break;
         }
 
+        case "message.part.removed": {
+          context.partById.delete(event.properties.partID);
+          context.emittedTextByPartId.delete(event.properties.partID);
+          context.observedReasoningTextByPartId.delete(event.properties.partID);
+          context.completedAssistantPartIds.delete(event.properties.partID);
+          break;
+        }
+
         case "message.part.delta": {
           const existingPart = context.partById.get(event.properties.partID);
           if (!existingPart) {
@@ -783,6 +862,37 @@ export function makeOpenCodeAdapter(
           if (delta.length === 0) {
             break;
           }
+          if (existingPart.type === "reasoning") {
+            const nextText =
+              (context.observedReasoningTextByPartId.get(event.properties.partID) ??
+                textFromPart(existingPart) ??
+                "") + delta;
+            context.observedReasoningTextByPartId.set(event.properties.partID, nextText);
+            context.partById.set(event.properties.partID, {
+              ...existingPart,
+              text: nextText,
+            });
+            const emittedText = context.emittedTextByPartId.get(event.properties.partID) ?? "";
+            const pendingDelta = nextText.slice(commonPrefixLength(emittedText, nextText));
+            if (pendingDelta.length < MIN_REASONING_DELTA_CHARS) {
+              break;
+            }
+            context.emittedTextByPartId.set(event.properties.partID, nextText);
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: event.properties.partID,
+                raw: event,
+              })),
+              type: "content.delta",
+              payload: {
+                streamKind: "reasoning_text",
+                delta: pendingDelta,
+              },
+            });
+            break;
+          }
           const previousText =
             context.emittedTextByPartId.get(event.properties.partID) ??
             textFromPart(existingPart) ??
@@ -792,7 +902,7 @@ export function makeOpenCodeAdapter(
             break;
           }
           context.emittedTextByPartId.set(event.properties.partID, nextText);
-          if (existingPart.type === "text" || existingPart.type === "reasoning") {
+          if (existingPart.type === "text") {
             context.partById.set(event.properties.partID, {
               ...existingPart,
               text: nextText,
@@ -825,8 +935,7 @@ export function makeOpenCodeAdapter(
 
           if (part.type === "tool") {
             const itemType = toToolLifecycleItemType(part.tool);
-            const title =
-              part.state.status === "running" ? (part.state.title ?? part.tool) : part.tool;
+            const title = toolPartTitle(part);
             const detail = detailFromToolPart(part);
             const payload = {
               itemType,
@@ -837,10 +946,7 @@ export function makeOpenCodeAdapter(
                   : { status: "inProgress" as const }),
               ...(title ? { title } : {}),
               ...(detail ? { detail } : {}),
-              data: {
-                tool: part.tool,
-                state: part.state,
-              },
+              data: toolPartData(part),
             };
             const runtimeEvent: ProviderRuntimeEvent = {
               ...(yield* buildEventBase({
@@ -861,6 +967,174 @@ export function makeOpenCodeAdapter(
             appendTurnItem(context, turnId, part);
             yield* emit(runtimeEvent);
           }
+
+          if (part.type === "subtask" && !context.emittedSubtaskPartIds.has(part.id)) {
+            context.emittedSubtaskPartIds.add(part.id);
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                raw: event,
+              })),
+              type: "task.started",
+              payload: {
+                taskId: RuntimeTaskId.make(part.id),
+                description: part.description,
+                taskType: part.agent,
+              },
+            });
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                raw: event,
+              })),
+              type: "task.progress",
+              payload: {
+                taskId: RuntimeTaskId.make(part.id),
+                description: part.description,
+                summary: part.description,
+                ...(part.command ? { lastToolName: part.command } : {}),
+              },
+            });
+          }
+
+          if (part.type === "agent" && !context.emittedAgentPartIds.has(part.id)) {
+            context.emittedAgentPartIds.add(part.id);
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                raw: event,
+              })),
+              type: "task.progress",
+              payload: {
+                taskId: RuntimeTaskId.make(part.id),
+                description: `Using ${part.name} agent`,
+                summary: `Using ${part.name} agent`,
+              },
+            });
+          }
+
+          if (part.type === "patch" && part.files.length > 0) {
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                raw: event,
+              })),
+              type: "item.completed",
+              payload: {
+                itemType: "file_change",
+                status: "completed",
+                title:
+                  part.files.length === 1 ? "Changed file" : `Changed ${part.files.length} files`,
+                data: { item: part },
+              },
+            });
+          }
+
+          if (part.type === "retry") {
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                createdAt: isoFromEpochMs(part.time.created),
+                raw: event,
+              })),
+              type: "runtime.warning",
+              payload: {
+                message: `Retrying request (attempt ${part.attempt})`,
+                detail: part.error,
+              },
+            });
+          }
+
+          const partCompactionKey = compactionKey(turnId);
+          if (part.type === "compaction" && !context.emittedCompactionKeys.has(partCompactionKey)) {
+            context.emittedCompactionKeys.add(partCompactionKey);
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                itemId: part.id,
+                raw: event,
+              })),
+              type: "thread.state.changed",
+              payload: {
+                state: "compacted",
+                detail: part,
+              },
+            });
+          }
+          break;
+        }
+
+        case "todo.updated": {
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              raw: event,
+            })),
+            type: "turn.plan.updated",
+            payload: {
+              plan: event.properties.todos.map((todo) => ({
+                step: todo.content,
+                status:
+                  todo.status === "completed" || todo.status === "cancelled"
+                    ? ("completed" as const)
+                    : todo.status === "in_progress"
+                      ? ("inProgress" as const)
+                      : ("pending" as const),
+              })),
+            },
+          });
+          break;
+        }
+
+        case "session.diff": {
+          const unifiedDiff = event.properties.diff
+            .map((file) => file.patch)
+            .filter((patch): patch is string => typeof patch === "string" && patch.length > 0)
+            .join("\n");
+          if (unifiedDiff.length > 0) {
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                raw: event,
+              })),
+              type: "turn.diff.updated",
+              payload: { unifiedDiff },
+            });
+          }
+          break;
+        }
+
+        case "session.compacted": {
+          const sessionCompactionKey = compactionKey(turnId);
+          if (context.emittedCompactionKeys.has(sessionCompactionKey)) {
+            break;
+          }
+          context.emittedCompactionKeys.add(sessionCompactionKey);
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              raw: event,
+            })),
+            type: "thread.state.changed",
+            payload: {
+              state: "compacted",
+              detail: { source: "opencode" },
+            },
+          });
           break;
         }
 
@@ -984,6 +1258,8 @@ export function makeOpenCodeAdapter(
 
           if (event.properties.status.type === "idle" && turnId) {
             context.activeTurnId = undefined;
+            context.activeAgent = undefined;
+            context.activeVariant = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
             yield* emit({
               ...(yield* buildEventBase({
@@ -995,6 +1271,25 @@ export function makeOpenCodeAdapter(
               payload: {
                 state: "completed",
               },
+            });
+          }
+          break;
+        }
+
+        case "session.idle": {
+          if (turnId) {
+            context.activeTurnId = undefined;
+            context.activeAgent = undefined;
+            context.activeVariant = undefined;
+            yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                raw: event,
+              })),
+              type: "turn.completed",
+              payload: { state: "completed" },
             });
           }
           break;
@@ -1180,7 +1475,7 @@ export function makeOpenCodeAdapter(
                       Effect.map((response) => response.data),
                       Effect.catchIf(
                         (cause) => isOpenCodeNotFound(cause),
-                        () => Effect.succeed(undefined),
+                        () => Effect.void,
                       ),
                     )
                   : undefined;
@@ -1330,8 +1625,12 @@ export function makeOpenCodeAdapter(
           pendingQuestions: new Map(),
           partById: new Map(),
           emittedTextByPartId: new Map(),
+          observedReasoningTextByPartId: new Map(),
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
+          emittedSubtaskPartIds: new Set(),
+          emittedAgentPartIds: new Set(),
+          emittedCompactionKeys: new Set(),
           turns: [],
           activeTurnId: undefined,
           activeAgent: undefined,

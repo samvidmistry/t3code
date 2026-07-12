@@ -696,10 +696,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       : null;
   const taskLabel = taskSummary || taskDetailAsLabel;
   const detail = isTaskActivity
-    ? !taskDetailAsLabel &&
-      payload &&
-      typeof payload.detail === "string" &&
-      payload.detail.length > 0
+    ? taskSummary && payload && typeof payload.detail === "string" && payload.detail.length > 0
       ? stripTrailingExitCode(payload.detail).output
       : null
     : extractToolDetail(payload, title ?? activity.summary);
@@ -734,11 +731,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (title) {
     entry.toolTitle = title;
   }
-  if (itemType === "mcp_tool_call") {
-    const data = asRecord(payload?.data);
-    if (data?.item !== undefined) {
-      entry.toolData = data.item;
-    }
+  const data = asRecord(payload?.data);
+  if (data?.item !== undefined) {
+    entry.toolData = data.item;
   }
   if (itemType) {
     entry.itemType = itemType;
@@ -1056,6 +1051,7 @@ function extractToolCommand(payload: Record<string, unknown> | null): {
     item?.command,
     itemInput?.command,
     itemResult?.command,
+    asRecord(data?.rawInput)?.command,
     data?.command,
     itemType === "command_execution" && detail ? stripTrailingExitCode(detail).output : null,
   ];

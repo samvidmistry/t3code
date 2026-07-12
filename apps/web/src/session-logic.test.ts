@@ -1119,6 +1119,34 @@ describe("deriveWorkLogEntries", () => {
     });
   });
 
+  it("keeps provider details for non-MCP tools", () => {
+    const item = {
+      type: "tool",
+      tool: "read",
+      state: { status: "completed", input: { filePath: "src/app.ts" } },
+    };
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "opencode-tool-details",
+        kind: "tool.completed",
+        summary: "Read src/app.ts",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read src/app.ts",
+          status: "completed",
+          data: { toolCallId: "call-1", item },
+        },
+      }),
+    ];
+
+    const [entry] = deriveWorkLogEntries(activities);
+    expect(entry).toMatchObject({
+      toolTitle: "Read src/app.ts",
+      toolData: item,
+      toolLifecycleStatus: "completed",
+    });
+  });
+
   it("extracts changed file paths for file-change tool activities", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

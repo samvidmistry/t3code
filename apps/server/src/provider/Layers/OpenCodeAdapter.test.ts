@@ -1042,6 +1042,132 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("normalizes OpenCode reasoning, tools, subtasks, and todos", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-progress");
+      const sessionID = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: { id: "msg-progress", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "reasoning-1",
+              sessionID,
+              messageID: "msg-progress",
+              type: "reasoning",
+              text: "Inspecting the event pipeline",
+              time: { start: 1, end: 2 },
+            },
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "tool-part-1",
+              sessionID,
+              messageID: "msg-progress",
+              type: "tool",
+              callID: "call-1",
+              tool: "read",
+              state: {
+                status: "completed",
+                input: { filePath: "src/app.ts" },
+                output: "file contents",
+                title: "Read src/app.ts",
+                metadata: {},
+                time: { start: 1, end: 2 },
+              },
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "subtask-1",
+              sessionID,
+              messageID: "msg-progress",
+              type: "subtask",
+              prompt: "Trace the frontend",
+              description: "Tracing the frontend event flow",
+              agent: "explore",
+            },
+            time: 3,
+          },
+        },
+        {
+          type: "todo.updated",
+          properties: {
+            sessionID,
+            todos: [
+              { content: "Trace events", status: "completed", priority: "high" },
+              { content: "Render progress", status: "in_progress", priority: "high" },
+            ],
+          },
+        },
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(7),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const reasoning = events.find(
+        (event) => event.type === "content.delta" && event.payload.streamKind === "reasoning_text",
+      );
+      const tool = events.find((event) => event.type === "item.completed");
+      const subtask = events.find((event) => event.type === "task.progress");
+      const plan = events.find((event) => event.type === "turn.plan.updated");
+
+      NodeAssert.equal(
+        reasoning?.type === "content.delta" ? reasoning.payload.delta : null,
+        "Inspecting the event pipeline",
+      );
+      NodeAssert.equal(
+        tool?.type === "item.completed" ? tool.payload.title : null,
+        "Read src/app.ts",
+      );
+      NodeAssert.equal(
+        tool?.type === "item.completed" &&
+          typeof tool.payload.data === "object" &&
+          tool.payload.data
+          ? (tool.payload.data as { toolCallId?: string }).toolCallId
+          : null,
+        "call-1",
+      );
+      NodeAssert.equal(
+        subtask?.type === "task.progress" ? subtask.payload.summary : null,
+        "Tracing the frontend event flow",
+      );
+      NodeAssert.deepEqual(plan?.type === "turn.plan.updated" ? plan.payload.plan : null, [
+        { step: "Trace events", status: "completed" },
+        { step: "Render progress", status: "inProgress" },
+      ]);
+    }),
+  );
+
   it.effect("writes provider-native observability records using the session thread id", () =>
     Effect.gen(function* () {
       const nativeEvents: Array<{

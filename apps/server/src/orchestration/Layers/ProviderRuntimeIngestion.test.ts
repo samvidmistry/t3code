@@ -2947,6 +2947,50 @@ describe("ProviderRuntimeIngestion", () => {
     ).toBe("# Plan title");
   });
 
+  it("accumulates reasoning deltas into one live activity", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const base = {
+      provider: ProviderDriverKind.make("opencode"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning-1"),
+      itemId: "reasoning-part-1",
+    } as const;
+
+    harness.emit({
+      ...base,
+      type: "content.delta",
+      eventId: asEventId("evt-reasoning-1"),
+      payload: { streamKind: "reasoning_text", delta: "Inspecting " },
+    });
+    harness.emit({
+      ...base,
+      type: "content.delta",
+      eventId: asEventId("evt-reasoning-2"),
+      payload: { streamKind: "reasoning_text", delta: "the event pipeline" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some((activity: ProviderRuntimeTestActivity) => {
+        if (activity.kind !== "task.progress" || typeof activity.payload !== "object") return false;
+        return (
+          (activity.payload as { summary?: unknown }).summary === "Inspecting the event pipeline"
+        );
+      }),
+    );
+    const reasoning = thread.activities.filter(
+      (activity: ProviderRuntimeTestActivity) => activity.kind === "task.progress",
+    );
+
+    expect(reasoning).toHaveLength(1);
+    expect(reasoning[0]?.tone).toBe("info");
+    expect(reasoning[0]?.payload).toMatchObject({
+      detail: "Inspecting the event pipeline",
+      summary: "Inspecting the event pipeline",
+    });
+  });
+
   it("projects structured user input request and resolution as thread activities", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
