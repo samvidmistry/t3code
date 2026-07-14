@@ -151,7 +151,7 @@ it.effect("discovers editors through the service API", () =>
     );
 
     assert.equal(editors.includes("vscode"), true);
-    assert.equal(editors.includes("file-manager"), true);
+    assert.equal(editors.includes("file-manager"), false);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

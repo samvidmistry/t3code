@@ -20,6 +20,15 @@ const HEALTHY_PI_SCRIPT = [
   "",
 ].join("\n");
 
+const AUTHENTICATED_PI_SCRIPT = [
+  "#!/bin/sh",
+  'case "$1" in',
+  '  --version) printf "pi 0.80.2\\n"; exit 0 ;;',
+  '  *) printf \'{"type":"response","command":"get_available_models","id":"pi-model-discovery","success":true,"data":{"models":[{"provider":"anthropic","id":"claude-test","name":"Claude Test","reasoning":true,"input":["text"],"contextWindow":200000,"maxTokens":64000}]}}\\n\'; exit 0 ;;',
+  "esac",
+  "",
+].join("\n");
+
 describe("buildInitialPiProviderSnapshot", () => {
   it.effect("returns a disabled snapshot when settings.enabled is false", () =>
     Effect.gen(function* () {
@@ -117,10 +126,10 @@ it.layer(NodeServices.layer)("checkPiProviderStatus", (it) => {
           const path = yield* Path.Path;
           const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-pi-ready-" });
           const piPath = path.join(dir, "pi");
-          yield* fs.writeFileString(piPath, HEALTHY_PI_SCRIPT);
+          yield* fs.writeFileString(piPath, AUTHENTICATED_PI_SCRIPT);
           yield* fs.chmod(piPath, 0o755);
           return yield* checkPiProviderStatus(
-            decodePiSettings({ enabled: true, binaryPath: piPath, customModels: ["x/y"] }),
+            decodePiSettings({ enabled: true, binaryPath: piPath }),
             dir,
           );
         }),

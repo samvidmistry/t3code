@@ -6,8 +6,9 @@ const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "glob"]);
 const EDIT_TOOLS = ["write", "edit", "multi_edit", "apply_patch"];
 
 function autoApprovedTools(approvalMode: string | undefined): ReadonlySet<string> {
-  if (approvalMode !== "auto-accept-edits") return new Set();
-  return new Set([...READ_ONLY_TOOLS, ...EDIT_TOOLS]);
+  return approvalMode === "auto-accept-edits"
+    ? new Set([...READ_ONLY_TOOLS, ...EDIT_TOOLS])
+    : READ_ONLY_TOOLS;
 }
 
 function gateDecision(opts: {
