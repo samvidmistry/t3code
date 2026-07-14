@@ -11,6 +11,7 @@ import {
 } from "@t3tools/contracts";
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
+const PI_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("pi");
 
 export interface SelectableModelOption {
   slug: string;
@@ -287,10 +288,9 @@ export function resolveSelectableModel(
 
 function resolveModelSlug(model: string | null | undefined, provider: ProviderDriverKind): string {
   const normalized = normalizeModelSlug(model, provider);
-  if (!normalized) {
-    return DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
-  }
-  return normalized;
+  if (normalized) return normalized;
+  if (provider === PI_PROVIDER_DRIVER_KIND) return "";
+  return DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
 }
 
 export function resolveModelSlugForProvider(
