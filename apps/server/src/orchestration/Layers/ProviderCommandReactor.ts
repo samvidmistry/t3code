@@ -13,6 +13,7 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
+import { truncate } from "@t3tools/shared/String";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -43,6 +44,7 @@ import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const COPILOT_DRIVER_KIND = ProviderDriverKind.make("copilot");
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -103,16 +105,48 @@ export function providerErrorLabelFromInstanceHint(input: {
   );
 }
 
-function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolean {
+function normalizeTitleSeedCandidate(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function canReplaceThreadTitle(
+  currentTitle: string,
+  titleSeed?: string,
+  sourceMessageText?: string,
+): boolean {
   const trimmedCurrentTitle = currentTitle.trim();
   if (trimmedCurrentTitle === DEFAULT_THREAD_TITLE) {
     return true;
   }
 
   const trimmedTitleSeed = titleSeed?.trim();
-  return trimmedTitleSeed !== undefined && trimmedTitleSeed.length > 0
-    ? trimmedCurrentTitle === trimmedTitleSeed
-    : false;
+  if (trimmedTitleSeed === undefined || trimmedTitleSeed.length === 0) {
+    return false;
+  }
+
+  if (trimmedCurrentTitle === trimmedTitleSeed) {
+    return true;
+  }
+
+  // Truncated seed expansion matching is only valid for client titles that
+  // explicitly use an ellipsis marker.
+  if (!trimmedTitleSeed.endsWith("...")) {
+    return false;
+  }
+
+  const normalizedCurrentTitle = normalizeTitleSeedCandidate(trimmedCurrentTitle);
+  const normalizedSourceMessage = sourceMessageText
+    ? normalizeTitleSeedCandidate(sourceMessageText)
+    : undefined;
+  const seededFromExpandedPrompt =
+    normalizedSourceMessage !== undefined && normalizedCurrentTitle === normalizedSourceMessage;
+  if (!seededFromExpandedPrompt) {
+    return false;
+  }
+
+  return (
+    truncate(trimmedCurrentTitle, Math.max(0, trimmedTitleSeed.length - 3)) === trimmedTitleSeed
+  );
 }
 
 function findProviderAdapterRequestError(
@@ -666,7 +700,6 @@ const make = Effect.gen(function* () {
     yield* Effect.gen(function* () {
       const { textGenerationModelSelection: modelSelection } =
         yield* serverSettingsService.getSettings;
-
       const generated = yield* textGeneration.generateBranchName({
         cwd,
         message: input.messageText,
@@ -711,7 +744,24 @@ const make = Effect.gen(function* () {
       yield* Effect.gen(function* () {
         const { textGenerationModelSelection: modelSelection } =
           yield* serverSettingsService.getSettings;
+        const textGenerationProvider = yield* providerService.getInstanceInfo(
+          modelSelection.instanceId,
+        );
+        if (textGenerationProvider.driverKind === COPILOT_DRIVER_KIND) {
+          const thread = yield* resolveThread(input.threadId);
+          if (!thread) return;
 
+          const currentTitle = thread.title.trim();
+          const titleSeed = input.titleSeed?.trim();
+          const hasClientSeededTitle =
+            currentTitle !== DEFAULT_THREAD_TITLE &&
+            titleSeed !== undefined &&
+            titleSeed.length > 0 &&
+            currentTitle === titleSeed;
+          if (hasClientSeededTitle) {
+            return;
+          }
+        }
         const generated = yield* textGeneration.generateThreadTitle({
           cwd: input.cwd,
           message: input.messageText,
@@ -722,7 +772,7 @@ const make = Effect.gen(function* () {
 
         const thread = yield* resolveThread(input.threadId);
         if (!thread) return;
-        if (!canReplaceThreadTitle(thread.title, input.titleSeed)) {
+        if (!canReplaceThreadTitle(thread.title, input.titleSeed, input.messageText)) {
           return;
         }
 
@@ -785,19 +835,23 @@ const make = Effect.gen(function* () {
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
       };
 
-      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
-        threadId: event.payload.threadId,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
-        ...generationInput,
-      }).pipe(Effect.forkScoped);
-
-      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
+      yield* firstTurnAuxiliaryWorker.enqueue(
+        maybeGenerateAndRenameWorktreeBranchForFirstTurn({
           threadId: event.payload.threadId,
-          cwd: generationCwd,
+          branch: thread.branch,
+          worktreePath: thread.worktreePath,
           ...generationInput,
-        }).pipe(Effect.forkScoped);
+        }),
+      );
+
+      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed, message.text)) {
+        yield* firstTurnAuxiliaryWorker.enqueue(
+          maybeGenerateThreadTitleForFirstTurn({
+            threadId: event.payload.threadId,
+            cwd: generationCwd,
+            ...generationInput,
+          }),
+        );
       }
     }
 
@@ -1058,6 +1112,9 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const firstTurnAuxiliaryWorker = yield* makeDrainableWorker((job: Effect.Effect<void>) => job, {
+    concurrency: "unbounded",
+  });
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
@@ -1081,7 +1138,7 @@ const make = Effect.gen(function* () {
 
   return {
     start,
-    drain: worker.drain,
+    drain: worker.drain.pipe(Effect.andThen(firstTurnAuxiliaryWorker.drain), Effect.asVoid),
   } satisfies ProviderCommandReactorShape;
 });
 
