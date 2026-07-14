@@ -1,12 +1,14 @@
 import { describe, expect, it } from "@effect/vitest";
 import type { ProviderApprovalDecision } from "@t3tools/contracts";
 
+import type { AgentSessionEvent } from "./PiRpcClient.ts";
 import {
   buildPiApprovalResponse,
   buildPiUserInputResponse,
   classifyPiApprovalRequestType,
   classifyPiToolItemType,
   isPiApprovalConfirmed,
+  normalizePiTokenUsage,
   parseNumberedList,
   summarizePiToolArgs,
 } from "./PiAdapter.ts";
@@ -47,6 +49,58 @@ describe("classifyPiApprovalRequestType", () => {
     expect(classifyPiApprovalRequestType("web_search")).toBe("dynamic_tool_call");
     expect(classifyPiApprovalRequestType("mcp__server__tool")).toBe("dynamic_tool_call");
     expect(classifyPiApprovalRequestType("some_unknown_tool")).toBe("dynamic_tool_call");
+  });
+});
+
+describe("normalizePiTokenUsage", () => {
+  it("maps Pi assistant usage to a context-window snapshot", () => {
+    const snapshot = normalizePiTokenUsage(
+      {
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          usage: {
+            input: 1_000,
+            output: 200,
+            cacheRead: 8_000,
+            cacheWrite: 300,
+            reasoning: 150,
+            totalTokens: 9_500,
+          },
+        },
+        toolResults: [],
+      } as unknown as AgentSessionEvent,
+      { contextWindow: 200_000, compactsAutomatically: true },
+    );
+
+    expect(snapshot).toEqual({
+      usedTokens: 9_500,
+      lastUsedTokens: 9_500,
+      maxTokens: 200_000,
+      inputTokens: 1_000,
+      lastInputTokens: 1_000,
+      cachedInputTokens: 8_300,
+      lastCachedInputTokens: 8_300,
+      outputTokens: 200,
+      lastOutputTokens: 200,
+      reasoningOutputTokens: 150,
+      lastReasoningOutputTokens: 150,
+      compactsAutomatically: true,
+    });
+  });
+
+  it("falls back to component totals and ignores events without usage", () => {
+    expect(
+      normalizePiTokenUsage({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          usage: { input: 10, output: 5, cacheRead: 20, cacheWrite: 2, totalTokens: 0 },
+        },
+        toolResults: [],
+      } as unknown as AgentSessionEvent),
+    ).toMatchObject({ usedTokens: 37, lastUsedTokens: 37 });
+    expect(normalizePiTokenUsage({ type: "agent_start" })).toBeUndefined();
   });
 });
 

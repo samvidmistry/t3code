@@ -9,6 +9,7 @@ import {
   extractAvailableModels,
   extractForkMessages,
   extractLastAssistantText,
+  extractPiContextConfig,
   extractReasoningTextDelta,
   extractSessionFile,
   parsePiStdoutLine,
@@ -24,6 +25,7 @@ import {
   resolveForkTargetEntryId,
   resolvePiThinkingLevel,
   splitPiModelSlug,
+  supportedPiThinkingLevels,
   tryParsePiJsonObject,
 } from "./PiRpcClient.ts";
 
@@ -157,15 +159,40 @@ describe("splitPiModelSlug / piModelSlug", () => {
 });
 
 describe("piModelCapabilities", () => {
-  it("exposes a thinking descriptor for reasoning models", () => {
-    const capabilities = piModelCapabilities(true);
-    expect((capabilities.optionDescriptors ?? []).map((descriptor) => descriptor.id)).toContain(
-      "thinking",
+  it("derives supported thinking levels from Pi model metadata", () => {
+    const model = asModelInfo({
+      provider: "anthropic",
+      id: "claude-opus",
+      reasoning: true,
+      thinkingLevelMap: {
+        low: null,
+        xhigh: "xhigh",
+        max: "max",
+      },
+    });
+
+    expect(supportedPiThinkingLevels(model)).toEqual([
+      "off",
+      "minimal",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    const options = (piModelCapabilities(model).optionDescriptors ?? []).flatMap((descriptor) =>
+      descriptor.type === "select" ? descriptor.options.map((option) => option.id) : [],
     );
+    expect(options).toEqual(["off", "minimal", "medium", "high", "xhigh", "max"]);
+  });
+
+  it("requires Pi to explicitly expose extended levels", () => {
+    const model = asModelInfo({ provider: "openai", id: "reasoning", reasoning: true });
+    expect(supportedPiThinkingLevels(model)).toEqual(["off", "minimal", "low", "medium", "high"]);
   });
 
   it("exposes no option descriptors for non-reasoning models", () => {
-    expect(piModelCapabilities(false).optionDescriptors ?? []).toEqual([]);
+    const model = asModelInfo({ provider: "openai", id: "gpt-4o", reasoning: false });
+    expect(piModelCapabilities(model).optionDescriptors ?? []).toEqual([]);
   });
 });
 
@@ -191,6 +218,47 @@ describe("piModelInfoToServerModel", () => {
     const model = piModelInfoToServerModel(asModelInfo({ provider: "openai", id: "gpt-4o-mini" }));
     expect(model.name).toBe("gpt-4o-mini");
     expect(model.capabilities?.optionDescriptors ?? []).toEqual([]);
+  });
+});
+
+describe("extractPiContextConfig", () => {
+  it("reads context metadata from get_state responses", () => {
+    expect(
+      extractPiContextConfig(
+        asResponse({
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: {
+            model: { contextWindow: 200_000 },
+            autoCompactionEnabled: true,
+          },
+        }),
+      ),
+    ).toEqual({ contextWindow: 200_000, compactsAutomatically: true });
+  });
+
+  it("reads context windows from set_model responses and rejects invalid values", () => {
+    expect(
+      extractPiContextConfig(
+        asResponse({
+          type: "response",
+          command: "set_model",
+          success: true,
+          data: { contextWindow: 1_000_000 },
+        }),
+      ),
+    ).toEqual({ contextWindow: 1_000_000 });
+    expect(
+      extractPiContextConfig(
+        asResponse({
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: { model: { contextWindow: 0 } },
+        }),
+      ),
+    ).toEqual({});
   });
 });
 
@@ -371,11 +439,16 @@ describe("buildPiTurnCommand", () => {
 });
 
 describe("asPiThinkingLevel / resolvePiThinkingLevel", () => {
-  it("keeps descriptor option ids in sync with the ThinkingLevel set", () => {
-    const descriptorIds = (piModelCapabilities(true).optionDescriptors ?? []).flatMap(
-      (descriptor) => (descriptor.type === "select" ? descriptor.options.map((o) => o.id) : []),
-    );
-    expect(descriptorIds).toEqual([...PI_THINKING_LEVEL_VALUES]);
+  it("keeps parser values in sync with Pi's complete ThinkingLevel set", () => {
+    expect(PI_THINKING_LEVEL_VALUES).toEqual([
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 
   it("resolves each valid thinking level from a model selection", () => {

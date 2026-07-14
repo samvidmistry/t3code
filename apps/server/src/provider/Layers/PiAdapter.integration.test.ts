@@ -61,7 +61,11 @@ const makeFakePiRpcTransport = Effect.gen(function* () {
       id: "x",
       command: "get_state",
       success: true,
-      data: { sessionFile: "/tmp/pi-session.json" },
+      data: {
+        sessionFile: "/tmp/pi-session.json",
+        model: { contextWindow: 200_000 },
+        autoCompactionEnabled: true,
+      },
     }),
   );
   responses.set(
@@ -161,6 +165,20 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
         type: "message_update",
         assistantMessageEvent: { type: "text_delta", delta: "hi" },
       } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          usage: {
+            input: 1_000,
+            output: 100,
+            cacheRead: 4_000,
+            cacheWrite: 0,
+            totalTokens: 5_100,
+          },
+        },
+        toolResults: [],
+      } as unknown as AgentSessionEvent);
       yield* fake.pushEvent({ type: "agent_end" } as AgentSessionEvent);
 
       const events = yield* Fiber.join(collected.fiber).pipe(
@@ -176,6 +194,19 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
         expect(delta.payload.streamKind).toBe("assistant_text");
         expect(delta.payload.delta).toBe("hi");
         expect(delta.raw?.source).toBe("pi.rpc.event");
+      }
+      const usage = events.find((event) => event.type === "thread.token-usage.updated");
+      expect(usage).toBeDefined();
+      if (usage?.type === "thread.token-usage.updated") {
+        expect(usage.payload.usage).toMatchObject({
+          usedTokens: 5_100,
+          maxTokens: 200_000,
+          inputTokens: 1_000,
+          cachedInputTokens: 4_000,
+          outputTokens: 100,
+          compactsAutomatically: true,
+        });
+        expect(usage.raw?.source).toBe("pi.rpc.event");
       }
       const completed = events.find((event) => event.type === "turn.completed");
       if (completed && completed.type === "turn.completed") {

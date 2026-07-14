@@ -131,9 +131,14 @@ const PI_THINKING_LEVELS = [
   { value: "medium", label: "Medium", isDefault: true },
   { value: "high", label: "High" },
   { value: "xhigh", label: "Extra High" },
+  { value: "max", label: "Max" },
 ] as const;
 
 export type PiThinkingLevel = Extract<RpcCommand, { type: "set_thinking_level" }>["level"];
+
+type PiModelThinkingMetadata = Pick<ModelInfo, "reasoning"> & {
+  readonly thinkingLevelMap?: Partial<Record<PiThinkingLevel, string | null>>;
+};
 
 export const PI_THINKING_OPTION_ID = "thinking";
 
@@ -177,24 +182,36 @@ export function planPiModelSwitch(
   return { kind: "switch", provider: parts.provider, modelId: parts.id, slug: requestedModel };
 }
 
-export function piModelCapabilities(
-  model: boolean | Pick<ModelInfo, "provider" | "id" | "reasoning">,
-): ModelCapabilities {
-  const reasoning = typeof model === "boolean" ? model : Boolean(model.reasoning);
-  const supportsExtraHigh =
-    typeof model === "boolean" || (model.provider === "openai" && model.id === "codex-max");
+export function supportedPiThinkingLevels(
+  model: PiModelThinkingMetadata,
+): ReadonlyArray<PiThinkingLevel> {
+  if (!model.reasoning) return ["off"];
+
+  // Match Pi's getSupportedThinkingLevels behavior. Standard levels are
+  // supported unless explicitly disabled; extended levels must be explicitly
+  // exposed by the model's thinkingLevelMap.
+  return PI_THINKING_LEVELS.flatMap(({ value }) => {
+    const mapped = model.thinkingLevelMap?.[value];
+    if (mapped === null) return [];
+    if ((value === "xhigh" || value === "max") && mapped === undefined) return [];
+    return [value];
+  });
+}
+
+export function piModelCapabilities(model: PiModelThinkingMetadata): ModelCapabilities {
+  if (!model.reasoning) return createModelCapabilities({ optionDescriptors: [] });
+
+  const supportedLevels = new Set(supportedPiThinkingLevels(model));
   return createModelCapabilities({
-    optionDescriptors: reasoning
-      ? [
-          buildSelectOptionDescriptor({
-            id: "thinking",
-            label: "Thinking",
-            options: PI_THINKING_LEVELS.filter(
-              (level) => level.value !== "xhigh" || supportsExtraHigh,
-            ).map((level) => ({ ...level })),
-          }),
-        ]
-      : [],
+    optionDescriptors: [
+      buildSelectOptionDescriptor({
+        id: "thinking",
+        label: "Thinking",
+        options: PI_THINKING_LEVELS.filter((level) => supportedLevels.has(level.value)).map(
+          (level) => ({ ...level }),
+        ),
+      }),
+    ],
   });
 }
 
@@ -221,6 +238,38 @@ export function extractSessionFile(response: RpcResponse | undefined): string | 
   return typeof sessionFile === "string" && sessionFile.trim().length > 0
     ? sessionFile.trim()
     : undefined;
+}
+
+export interface PiContextConfig {
+  readonly contextWindow?: number;
+  readonly compactsAutomatically?: boolean;
+}
+
+/** Extract context metadata from either get_state or set_model response data. */
+export function extractPiContextConfig(response: RpcResponse | undefined): PiContextConfig {
+  const data = piResponseData(response);
+  if (!data) return {};
+
+  const nestedModel = data["model"];
+  const model =
+    nestedModel !== null && typeof nestedModel === "object"
+      ? (nestedModel as Record<string, unknown>)
+      : data;
+  const rawContextWindow = model["contextWindow"];
+  const contextWindow =
+    typeof rawContextWindow === "number" &&
+    Number.isFinite(rawContextWindow) &&
+    rawContextWindow > 0
+      ? Math.round(rawContextWindow)
+      : undefined;
+  const autoCompactionEnabled = data["autoCompactionEnabled"];
+
+  return {
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(typeof autoCompactionEnabled === "boolean"
+      ? { compactsAutomatically: autoCompactionEnabled }
+      : {}),
+  };
 }
 
 export function extractAvailableModels(

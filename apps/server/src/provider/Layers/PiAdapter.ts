@@ -18,6 +18,7 @@ import {
   RuntimeItemId,
   RuntimeRequestId,
   ThreadId,
+  type ThreadTokenUsageSnapshot,
   TurnId,
   type UserInputQuestion,
 } from "@t3tools/contracts";
@@ -49,6 +50,7 @@ import {
   buildPiTurnCommand,
   extractAssistantTextDelta,
   extractForkMessages,
+  extractPiContextConfig,
   extractReasoningTextDelta,
   extractSessionFile,
   makePiRpcTransport,
@@ -152,6 +154,8 @@ interface PiSessionContext {
   stopped: boolean;
   // slug the pi process is running; used to issue set_model only on change
   currentModel: string | undefined;
+  currentContextWindow: number | undefined;
+  compactsAutomatically: boolean | undefined;
   appliedThinkingLevel: PiThinkingLevel | undefined;
 }
 
@@ -192,6 +196,55 @@ export function classifyPiApprovalRequestType(toolHint: string): CanonicalReques
       // would be dropped by the runtime-ingestion + web approval pipeline
       return "dynamic_tool_call";
   }
+}
+
+function finiteNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : undefined;
+}
+
+export function normalizePiTokenUsage(
+  event: AgentSessionEvent,
+  options: {
+    readonly contextWindow?: number;
+    readonly compactsAutomatically?: boolean;
+  } = {},
+): ThreadTokenUsageSnapshot | undefined {
+  if (event.type !== "turn_end" || event.message.role !== "assistant") return undefined;
+
+  const usage = event.message.usage;
+  const inputTokens = finiteNonNegativeInteger(usage.input) ?? 0;
+  const outputTokens = finiteNonNegativeInteger(usage.output) ?? 0;
+  const cacheReadTokens = finiteNonNegativeInteger(usage.cacheRead) ?? 0;
+  const cacheWriteTokens = finiteNonNegativeInteger(usage.cacheWrite) ?? 0;
+  const cachedInputTokens = cacheReadTokens + cacheWriteTokens;
+  const reportedTotal = finiteNonNegativeInteger(usage.totalTokens) ?? 0;
+  // Mirrors Pi's calculateContextTokens: prefer the provider total, then sum
+  // the components for providers that leave totalTokens at zero.
+  const usedTokens =
+    reportedTotal > 0
+      ? reportedTotal
+      : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  if (usedTokens <= 0) return undefined;
+
+  const reasoningOutputTokens = finiteNonNegativeInteger(usage.reasoning);
+  return {
+    usedTokens,
+    lastUsedTokens: usedTokens,
+    ...(options.contextWindow !== undefined ? { maxTokens: options.contextWindow } : {}),
+    ...(inputTokens > 0 ? { inputTokens, lastInputTokens: inputTokens } : {}),
+    ...(cachedInputTokens > 0
+      ? { cachedInputTokens, lastCachedInputTokens: cachedInputTokens }
+      : {}),
+    ...(outputTokens > 0 ? { outputTokens, lastOutputTokens: outputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined
+      ? { reasoningOutputTokens, lastReasoningOutputTokens: reasoningOutputTokens }
+      : {}),
+    ...(options.compactsAutomatically !== undefined
+      ? { compactsAutomatically: options.compactsAutomatically }
+      : {}),
+  };
 }
 
 export function summarizePiToolArgs(args: unknown): string | undefined {
@@ -522,7 +575,23 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         }
 
         case "turn_end": {
-          // agent_end drives completion, not turn_end (pi runs many internal turns per prompt)
+          const usage = normalizePiTokenUsage(event, {
+            ...(context.currentContextWindow !== undefined
+              ? { contextWindow: context.currentContextWindow }
+              : {}),
+            ...(context.compactsAutomatically !== undefined
+              ? { compactsAutomatically: context.compactsAutomatically }
+              : {}),
+          });
+          if (usage) {
+            yield* offerRuntimeEvent({
+              ...base,
+              ...(context.turnState ? { turnId: context.turnState.turnId } : {}),
+              type: "thread.token-usage.updated",
+              payload: { usage },
+            });
+          }
+          // agent_end drives completion (Pi can run many internal turns per prompt).
           return;
         }
 
@@ -849,6 +918,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         });
       }
       context.currentModel = plan.slug;
+      const contextConfig = extractPiContextConfig(response);
+      context.currentContextWindow = contextConfig.contextWindow;
       context.session = { ...context.session, model: plan.slug };
       // a model switch can reset the thinking level — force re-apply next turn
       context.appliedThinkingLevel = undefined;
@@ -981,6 +1052,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       turns: [],
       stopped: false,
       currentModel: modelSelection?.model,
+      currentContextWindow: undefined,
+      compactsAutomatically: undefined,
       appliedThinkingLevel: thinkingLevel,
     };
     sessions.set(threadId, context);
@@ -1001,6 +1074,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       PI_STATE_TIMEOUT_MS,
     );
     const sessionFile = extractSessionFile(stateResponse);
+    const contextConfig = extractPiContextConfig(stateResponse);
+    context.currentContextWindow = contextConfig.contextWindow;
+    context.compactsAutomatically = contextConfig.compactsAutomatically;
     if (sessionFile !== undefined) {
       context.session = { ...context.session, resumeCursor: { sessionFile } };
     }
@@ -1305,6 +1381,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         PI_STATE_TIMEOUT_MS,
       );
       const sessionFile = extractSessionFile(stateResponse);
+      const contextConfig = extractPiContextConfig(stateResponse);
+      context.currentContextWindow = contextConfig.contextWindow;
+      context.compactsAutomatically = contextConfig.compactsAutomatically;
       const updatedAt = yield* nowIso;
       context.session = {
         ...context.session,
