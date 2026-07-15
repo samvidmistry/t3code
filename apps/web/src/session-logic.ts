@@ -147,7 +147,7 @@ export type TimelineEntry =
     };
 
 export function workLogEntryIsToolLike(entry: WorkLogEntry): boolean {
-  if (entry.tone === "tool" || entry.tone === "thinking" || entry.tone === "error") {
+  if (entry.tone === "tool" || entry.tone === "error") {
     return true;
   }
   if (entry.command !== undefined && entry.command.trim().length > 0) {

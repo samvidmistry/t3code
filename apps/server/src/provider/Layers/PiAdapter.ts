@@ -119,6 +119,8 @@ interface PiTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
   readonly items: Array<PiToolItem>;
+  activeAssistantItemId: RuntimeItemId | undefined;
+  activeAssistantHasText: boolean;
 }
 
 interface PendingApproval {
@@ -381,6 +383,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const offerRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
 
+  const makeTurnState = (turnId: TurnId, startedAt: string): PiTurnState => ({
+    turnId,
+    startedAt,
+    items: [],
+    activeAssistantItemId: undefined,
+    activeAssistantHasText: false,
+  });
+
   const rawEvent = (
     source: "pi.rpc.event" | "pi.rpc.extension-ui",
     method: string,
@@ -421,7 +431,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     Effect.gen(function* () {
       const turnId = TurnId.make(yield* nextUuid);
       const startedAt = yield* nowIso;
-      context.turnState = { turnId, startedAt, items: [] };
+      context.turnState = makeTurnState(turnId, startedAt);
       context.session = {
         ...context.session,
         status: "running",
@@ -473,26 +483,62 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         }
 
         case "message_update": {
-          if (!context.turnState) return;
+          const turnState = context.turnState;
+          if (!turnState) return;
           const text = extractAssistantTextDelta(event);
+          const reasoning = text === null ? extractReasoningTextDelta(event) : null;
+          if (text === null && reasoning === null) return;
+
+          const itemId =
+            turnState.activeAssistantItemId ??
+            RuntimeItemId.make(`pi-assistant-${yield* nextUuid}`);
+          turnState.activeAssistantItemId = itemId;
+
           if (text !== null) {
+            turnState.activeAssistantHasText = true;
             yield* offerRuntimeEvent({
               ...base,
-              turnId: context.turnState.turnId,
+              turnId: turnState.turnId,
+              itemId,
               type: "content.delta",
               payload: { streamKind: "assistant_text", delta: text },
             });
             return;
           }
-          const reasoning = extractReasoningTextDelta(event);
+
           if (reasoning !== null) {
             yield* offerRuntimeEvent({
               ...base,
-              turnId: context.turnState.turnId,
+              turnId: turnState.turnId,
+              itemId,
               type: "content.delta",
               payload: { streamKind: "reasoning_text", delta: reasoning },
             });
           }
+          return;
+        }
+
+        case "message_end": {
+          const turnState = context.turnState;
+          if (!turnState || event.message.role !== "assistant") return;
+
+          const itemId = turnState.activeAssistantItemId;
+          const hasText = turnState.activeAssistantHasText;
+          turnState.activeAssistantItemId = undefined;
+          turnState.activeAssistantHasText = false;
+          if (!itemId || !hasText) return;
+
+          yield* offerRuntimeEvent({
+            ...base,
+            turnId: turnState.turnId,
+            itemId,
+            type: "item.completed",
+            payload: {
+              itemType: "assistant_message",
+              status: "completed",
+              title: "Assistant message",
+            },
+          });
           return;
         }
 
@@ -1179,7 +1225,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     if (!context.turnState) {
       const turnId = TurnId.make(yield* nextUuid);
       const startedAt = yield* nowIso;
-      context.turnState = { turnId, startedAt, items: [] };
+      context.turnState = makeTurnState(turnId, startedAt);
       context.session = {
         ...context.session,
         status: "running",

@@ -218,6 +218,83 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
     }),
   );
 
+  it.effect("completes each assistant response at message_end", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-message-boundaries");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "inspect then answer", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "I'll inspect first." },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "message_end",
+        message: { role: "assistant" },
+      } as unknown as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "read-1",
+        toolName: "read",
+        args: { path: "src/app.ts" },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "read-1",
+        toolName: "read",
+        result: "contents",
+        isError: false,
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "Inspection complete." },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "message_end",
+        message: { role: "assistant" },
+      } as unknown as AgentSessionEvent);
+      yield* fake.pushEvent({ type: "agent_end" } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      const assistantDeltas = events.filter(
+        (event) => event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+      );
+      const assistantCompletions = events.filter(
+        (event) =>
+          event.type === "item.completed" && event.payload.itemType === "assistant_message",
+      );
+
+      expect(assistantDeltas).toHaveLength(2);
+      expect(assistantCompletions).toHaveLength(2);
+      expect(assistantDeltas[0]?.itemId).toBeDefined();
+      expect(assistantDeltas[1]?.itemId).toBeDefined();
+      expect(assistantDeltas[0]?.itemId).not.toBe(assistantDeltas[1]?.itemId);
+      expect(assistantCompletions.map((event) => event.itemId)).toEqual(
+        assistantDeltas.map((event) => event.itemId),
+      );
+
+      const firstCompletionIndex = events.indexOf(assistantCompletions[0]!);
+      const toolStartIndex = events.findIndex((event) => event.type === "item.started");
+      const secondDeltaIndex = events.indexOf(assistantDeltas[1]!);
+      expect(firstCompletionIndex).toBeLessThan(toolStartIndex);
+      expect(toolStartIndex).toBeLessThan(secondDeltaIndex);
+    }),
+  );
+
   it.effect("maps thinking_delta to a reasoning_text content delta", () =>
     Effect.gen(function* () {
       const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());

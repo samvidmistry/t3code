@@ -941,6 +941,34 @@ describe("deriveMessagesTimelineRows", () => {
     expect(assistantRow?.showAssistantCopyButton).toBe(false);
   });
 
+  it("keeps reasoning work entries visible", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "reasoning-entry",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:01Z",
+          entry: {
+            id: "reasoning-1",
+            createdAt: "2026-01-01T00:00:01Z",
+            label: "Reasoning summary",
+            detail: "Inspecting the event pipeline",
+            tone: "thinking",
+          },
+        },
+      ],
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.find((row) => row.kind === "work")).toMatchObject({
+      kind: "work",
+      groupedEntries: [{ id: "reasoning-1", tone: "thinking" }],
+    });
+  });
+
   it("models work log overflow expansion as inserted list rows", () => {
     const timelineEntries = [
       {
