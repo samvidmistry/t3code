@@ -43,6 +43,37 @@ const DEFAULT_CLAUDE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabili
   optionDescriptors: [],
 });
 
+const GPT_5_6_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [
+    buildSelectOptionDescriptor({
+      id: "effort",
+      label: "Reasoning",
+      options: [
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High", isDefault: true },
+        { value: "xhigh", label: "Extra High" },
+        { value: "max", label: "Max" },
+        { value: "ultracode", label: "Ultracode" },
+        { value: "ultrathink", label: "Ultrathink" },
+      ],
+      promptInjectedValues: ["ultrathink"],
+    }),
+    buildBooleanOptionDescriptor({
+      id: "fastMode",
+      label: "Fast Mode",
+    }),
+    buildSelectOptionDescriptor({
+      id: "contextWindow",
+      label: "Context Window",
+      options: [
+        { value: "200k", label: "200k", isDefault: true },
+        { value: "1m", label: "1M" },
+      ],
+    }),
+  ],
+});
+
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
 const CLAUDE_PRESENTATION = {
   displayName: "Claude",
@@ -53,6 +84,24 @@ const MINIMUM_CLAUDE_OPUS_4_8_VERSION = "2.1.154";
 const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
 
 const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
+  {
+    slug: "gpt-5.6-sol",
+    name: "GPT-5.6 Sol",
+    isCustom: false,
+    capabilities: GPT_5_6_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "gpt-5.6-terra",
+    name: "GPT-5.6 Terra",
+    isCustom: false,
+    capabilities: GPT_5_6_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "gpt-5.6-luna",
+    name: "GPT-5.6 Luna",
+    isCustom: false,
+    capabilities: GPT_5_6_MODEL_CAPABILITIES,
+  },
   {
     slug: "claude-fable-5",
     name: "Claude Fable 5",
@@ -108,6 +157,14 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
           id: "fastMode",
           label: "Fast Mode",
         }),
+        buildSelectOptionDescriptor({
+          id: "contextWindow",
+          label: "Context Window",
+          options: [
+            { value: "200k", label: "200k" },
+            { value: "1m", label: "1M", isDefault: true },
+          ],
+        }),
       ],
     }),
   },
@@ -133,6 +190,14 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
         buildBooleanOptionDescriptor({
           id: "fastMode",
           label: "Fast Mode",
+        }),
+        buildSelectOptionDescriptor({
+          id: "contextWindow",
+          label: "Context Window",
+          options: [
+            { value: "200k", label: "200k" },
+            { value: "1m", label: "1M", isDefault: true },
+          ],
         }),
       ],
     }),
@@ -354,6 +419,7 @@ export function normalizeClaudeCliEffort(
   }
   if (
     effort === "xhigh" &&
+    !model?.startsWith("gpt-5.6-") &&
     model !== "claude-fable-5" &&
     model !== "claude-opus-4-8" &&
     model !== "claude-sonnet-5"

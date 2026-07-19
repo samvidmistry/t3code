@@ -1497,6 +1497,51 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           assert.strictEqual(status.status, "ready");
           assert.strictEqual(status.installed, true);
           assert.strictEqual(status.auth.status, "authenticated");
+          const gpt56Models = status.models.filter((model) => model.slug.startsWith("gpt-5.6-"));
+          assert.deepStrictEqual(
+            gpt56Models.map(({ slug, name, isCustom }) => ({ slug, name, isCustom })),
+            [
+              { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", isCustom: false },
+              { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra", isCustom: false },
+              { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna", isCustom: false },
+            ],
+          );
+          for (const model of gpt56Models) {
+            assert.ok(model.capabilities);
+            assert.deepStrictEqual(model.capabilities.optionDescriptors, [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "low", label: "Low" },
+                  { id: "medium", label: "Medium" },
+                  { id: "high", label: "High", isDefault: true },
+                  { id: "xhigh", label: "Extra High" },
+                  { id: "max", label: "Max" },
+                  { id: "ultracode", label: "Ultracode" },
+                  { id: "ultrathink", label: "Ultrathink" },
+                ],
+                currentValue: "high",
+                promptInjectedValues: ["ultrathink"],
+              },
+              {
+                id: "fastMode",
+                label: "Fast Mode",
+                type: "boolean",
+              },
+              {
+                id: "contextWindow",
+                label: "Context Window",
+                type: "select",
+                options: [
+                  { id: "200k", label: "200k", isDefault: true },
+                  { id: "1m", label: "1M" },
+                ],
+                currentValue: "200k",
+              },
+            ]);
+          }
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args) => {
