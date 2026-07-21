@@ -89,7 +89,7 @@ const modelsFromSettings = (
   piSettings: PiSettings,
   discovered: ReadonlyArray<ServerProviderModel>,
 ): ReadonlyArray<ServerProviderModel> =>
-  providerModelsFromSettings(discovered, PROVIDER, piSettings.customModels, EMPTY_CAPABILITIES);
+  providerModelsFromSettings(discovered, piSettings.customModels, EMPTY_CAPABILITIES);
 
 export const buildInitialPiProviderSnapshot = Effect.fn("buildInitialPiProviderSnapshot")(
   function* (piSettings: PiSettings) {

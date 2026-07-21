@@ -557,7 +557,6 @@ export function modelsFromCopilotSdk(input: {
 
   return providerModelsFromSettings(
     builtInModels,
-    PROVIDER,
     input.customModels,
     EMPTY_COPILOT_MODEL_CAPABILITIES,
   );
