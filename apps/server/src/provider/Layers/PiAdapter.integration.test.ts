@@ -135,6 +135,189 @@ const enabledSettings = (overrides: Record<string, unknown> = {}) =>
   decodePiSettings({ enabled: true, ...overrides });
 
 it.layer(HarnessLayer)("PiAdapter integration", (it) => {
+  it.effect(
+    "streams progress for same-length text, tool call, tool result, and usage-only changes",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+        const threadId = ThreadId.make("pi-int-subagent-stream");
+        const collected = yield* collectEvents(
+          adapter,
+          threadId,
+          (event) => event.type === "turn.completed",
+        );
+        yield* adapter.startSession({
+          threadId,
+          provider: PI,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({ threadId, input: "delegate", attachments: [] });
+        yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+        yield* fake.pushEvent({
+          type: "tool_execution_start",
+          toolCallId: "sa-6",
+          toolName: "subagent",
+          args: { agent: "worker", task: "do the thing" },
+        } as AgentSessionEvent);
+
+        const child = (
+          messages: ReadonlyArray<Record<string, unknown>>,
+          usage?: Record<string, number>,
+        ) => subagentResult({ exitCode: -1, messages, ...(usage ? { usage } : {}) });
+        const text = (t: string) => ({ role: "assistant", content: [{ type: "text", text: t }] });
+        const toolCall = {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+        };
+        const toolResult = {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: [{ type: "text", text: "contents" }],
+          isError: false,
+        };
+
+        // 1: text "aaaa"
+        yield* fake.pushEvent(subagentUpdate("sa-6", "single", [child([text("aaaa")])]));
+        // 2: same-length but different text "bbbb" (length-only cursor would miss this)
+        yield* fake.pushEvent(subagentUpdate("sa-6", "single", [child([text("bbbb")])]));
+        // 3: an assistant tool call
+        yield* fake.pushEvent(subagentUpdate("sa-6", "single", [child([text("bbbb"), toolCall])]));
+        // 4: the corresponding tool result
+        yield* fake.pushEvent(
+          subagentUpdate("sa-6", "single", [child([text("bbbb"), toolCall, toolResult])]),
+        );
+        // 5: usage-only change (token streaming), same transcript
+        yield* fake.pushEvent(
+          subagentUpdate("sa-6", "single", [
+            child([text("bbbb"), toolCall, toolResult], {
+              input: 100,
+              output: 21,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 121,
+              turns: 1,
+            }),
+          ]),
+        );
+        // 6: exact duplicate of #5 -> deduped, no new progress
+        yield* fake.pushEvent(
+          subagentUpdate("sa-6", "single", [
+            child([text("bbbb"), toolCall, toolResult], {
+              input: 100,
+              output: 21,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 121,
+              turns: 1,
+            }),
+          ]),
+        );
+        yield* fake.pushEvent(subagentEnd("sa-6", "single", [subagentResult()]));
+        yield* fake.pushEvent({
+          type: "agent_end",
+          messages: [],
+          willRetry: false,
+        } as AgentSessionEvent);
+
+        const events = yield* Fiber.join(collected.fiber).pipe(
+          Effect.flatMap(() => Ref.get(collected.store)),
+        );
+        const progress = events.filter((e) => e.type === "task.progress");
+        const descriptions = progress.flatMap((e) =>
+          e.type === "task.progress" ? [e.payload.description] : [],
+        );
+        expect(descriptions).toEqual(["aaaa", "bbbb", "Using read", "Ran read", "Ran read"]);
+        // the tool-call progress carries the resolved lastToolName
+        const usingRead = progress.find(
+          (e) => e.type === "task.progress" && e.payload.description === "Using read",
+        );
+        if (usingRead?.type === "task.progress") {
+          expect(usingRead.payload.lastToolName).toBe("read");
+        }
+        expect(events.filter((e) => e.type === "task.completed")).toHaveLength(1);
+      }),
+  );
+
+  it.effect("defers task.started for untouched queued parallel placeholders", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-placeholder");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "delegate two", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-7",
+        toolName: "subagent",
+        args: {},
+      } as AgentSessionEvent);
+      // child 0 has begun (real activity); child 1 is still a queued placeholder
+      yield* fake.pushEvent(
+        subagentUpdate("sa-7", "parallel", [
+          subagentResult({
+            agent: "a",
+            task: "task a",
+            exitCode: -1,
+            messages: [{ role: "assistant", content: [{ type: "text", text: "a working" }] }],
+          }),
+          { agent: "b", task: "task b", exitCode: -1, messages: [], usage: {} },
+        ]),
+      );
+
+      yield* fake.pushEvent(
+        subagentEnd("sa-7", "parallel", [
+          subagentResult({ agent: "a", task: "task a", exitCode: 0 }),
+          subagentResult({ agent: "b", task: "task b", exitCode: 0 }),
+        ]),
+      );
+      yield* fake.pushEvent({
+        type: "agent_end",
+        messages: [],
+        willRetry: false,
+      } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      const started = events.filter((e) => e.type === "task.started");
+      const completed = events.filter((e) => e.type === "task.completed");
+      // both children eventually start + complete...
+      expect(started).toHaveLength(2);
+      expect(completed).toHaveLength(2);
+
+      const idx = (type: string, taskId: string) =>
+        events.findIndex(
+          (e) =>
+            (e.type === "task.started" || e.type === "task.completed") &&
+            e.type === type &&
+            e.payload.taskId === taskId,
+        );
+      const child0Completed = idx("task.completed", "pi-subagent:sa-7:0");
+      const child1Started = idx("task.started", "pi-subagent:sa-7:1");
+      const child1Completed = idx("task.completed", "pi-subagent:sa-7:1");
+      // child 0 (observable) starts + emits progress during the update
+      expect(idx("task.started", "pi-subagent:sa-7:0")).toBeGreaterThanOrEqual(0);
+      // the deferred placeholder does not start until the final snapshot: if it had
+      // NOT been deferred it would have started during the first (update) event,
+      // i.e. before child 0 completed. Here it starts only at final completion.
+      expect(child1Started).toBeGreaterThan(child0Completed);
+      expect(child1Started).toBeLessThan(child1Completed);
+    }),
+  );
   it.effect("starts a session, streams assistant text, and completes the turn", () =>
     Effect.gen(function* () {
       const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
@@ -614,6 +797,357 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       const turnStarts = events.filter((event) => event.type === "turn.started");
       expect(turnStarts.length).toBe(1);
       expect(fake.commands.some((command) => command.type === "steer")).toBe(true);
+    }),
+  );
+
+  const subagentResult = (overrides: Record<string, unknown> = {}) => ({
+    agent: "worker",
+    agentSource: "user",
+    task: "do the thing",
+    exitCode: 0,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    stderr: "",
+    usage: {
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      contextTokens: 120,
+      turns: 1,
+    },
+    ...overrides,
+  });
+
+  const subagentUpdate = (
+    toolCallId: string,
+    mode: "single" | "parallel" | "chain",
+    results: ReadonlyArray<Record<string, unknown>>,
+  ) =>
+    ({
+      type: "tool_execution_update",
+      toolCallId,
+      toolName: "subagent",
+      args: {},
+      partialResult: {
+        content: [{ type: "text", text: "(running...)" }],
+        details: { mode, agentScope: "user", projectAgentsDir: null, results },
+      },
+    }) as unknown as AgentSessionEvent;
+
+  const subagentEnd = (
+    toolCallId: string,
+    mode: "single" | "parallel" | "chain",
+    results: ReadonlyArray<Record<string, unknown>>,
+    isError = false,
+  ) =>
+    ({
+      type: "tool_execution_end",
+      toolCallId,
+      toolName: "subagent",
+      isError,
+      result: {
+        content: [{ type: "text", text: "final" }],
+        details: { mode, agentScope: "user", projectAgentsDir: null, results },
+      },
+    }) as unknown as AgentSessionEvent;
+
+  it.effect("maps a single subagent run to task.started/progress/completed", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-single");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "delegate", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-1",
+        toolName: "subagent",
+        args: { agent: "worker", task: "do the thing" },
+      } as AgentSessionEvent);
+      // streaming update: partial assistant text
+      yield* fake.pushEvent(
+        subagentUpdate("sa-1", "single", [
+          subagentResult({
+            messages: [{ role: "assistant", content: [{ type: "text", text: "working" }] }],
+          }),
+        ]),
+      );
+      // duplicate cumulative update: no new progress
+      yield* fake.pushEvent(
+        subagentUpdate("sa-1", "single", [
+          subagentResult({
+            messages: [{ role: "assistant", content: [{ type: "text", text: "working" }] }],
+          }),
+        ]),
+      );
+      yield* fake.pushEvent(subagentEnd("sa-1", "single", [subagentResult()]));
+      yield* fake.pushEvent({
+        type: "agent_end",
+        messages: [],
+        willRetry: false,
+      } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      const started = events.filter((e) => e.type === "task.started");
+      const progress = events.filter((e) => e.type === "task.progress");
+      const completed = events.filter((e) => e.type === "task.completed");
+      expect(started).toHaveLength(1);
+      // one progress from "working"; the duplicate snapshot is deduped
+      expect(progress).toHaveLength(1);
+      expect(completed).toHaveLength(1);
+      if (started[0]?.type === "task.started") {
+        expect(started[0].payload.taskId).toBe("pi-subagent:sa-1:0");
+        expect(started[0].payload.taskType).toBe("worker");
+      }
+      if (completed[0]?.type === "task.completed") {
+        expect(completed[0].payload.status).toBe("completed");
+      }
+
+      // task.completed must precede the parent item.completed
+      const parentCompletedIndex = events.findIndex(
+        (e) => e.type === "item.completed" && e.itemId === "sa-1",
+      );
+      const taskCompletedIndex = events.findIndex((e) => e.type === "task.completed");
+      expect(taskCompletedIndex).toBeGreaterThanOrEqual(0);
+      expect(taskCompletedIndex).toBeLessThan(parentCompletedIndex);
+    }),
+  );
+
+  it.effect("maps parallel subagent runs to stable per-child task ids and statuses", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-parallel");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "delegate two", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-2",
+        toolName: "subagent",
+        args: {},
+      } as AgentSessionEvent);
+      // first update: both placeholders running
+      yield* fake.pushEvent(
+        subagentUpdate("sa-2", "parallel", [
+          { agent: "a", task: "task a", exitCode: -1, messages: [], usage: {} },
+          { agent: "b", task: "task b", exitCode: -1, messages: [], usage: {} },
+        ]),
+      );
+      yield* fake.pushEvent(
+        subagentEnd("sa-2", "parallel", [
+          subagentResult({ agent: "a", task: "task a", exitCode: 0 }),
+          subagentResult({ agent: "b", task: "task b", exitCode: 1, stopReason: "error" }),
+        ]),
+      );
+      yield* fake.pushEvent({
+        type: "agent_end",
+        messages: [],
+        willRetry: false,
+      } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      const started = events.filter((e) => e.type === "task.started");
+      const completed = events.filter((e) => e.type === "task.completed");
+      expect(started).toHaveLength(2);
+      expect(completed).toHaveLength(2);
+      const startedIds = started.flatMap((e) =>
+        e.type === "task.started" ? [e.payload.taskId] : [],
+      );
+      expect(startedIds).toEqual(["pi-subagent:sa-2:0", "pi-subagent:sa-2:1"]);
+      const statuses = completed.flatMap((e) =>
+        e.type === "task.completed" ? [e.payload.status] : [],
+      );
+      expect(statuses).toEqual(["completed", "failed"]);
+    }),
+  );
+
+  it.effect("maps chain subagent steps and an aborted child to stopped", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-chain");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "chain", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-3",
+        toolName: "subagent",
+        args: {},
+      } as AgentSessionEvent);
+      yield* fake.pushEvent(
+        subagentUpdate("sa-3", "chain", [
+          subagentResult({ agent: "scout", task: "scout", step: 1 }),
+        ]),
+      );
+      yield* fake.pushEvent(
+        subagentEnd(
+          "sa-3",
+          "chain",
+          [
+            subagentResult({ agent: "scout", task: "scout", step: 1, exitCode: 0 }),
+            subagentResult({
+              agent: "worker",
+              task: "impl",
+              step: 2,
+              exitCode: 1,
+              stopReason: "aborted",
+            }),
+          ],
+          true,
+        ),
+      );
+      yield* fake.pushEvent({
+        type: "agent_end",
+        messages: [],
+        willRetry: false,
+      } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      const completed = events.filter((e) => e.type === "task.completed");
+      expect(completed).toHaveLength(2);
+      const byId = new Map(
+        completed.flatMap((e) =>
+          e.type === "task.completed"
+            ? [[String(e.payload.taskId), e.payload.status] as const]
+            : [],
+        ),
+      );
+      expect(byId.get("pi-subagent:sa-3:0")).toBe("completed");
+      expect(byId.get("pi-subagent:sa-3:1")).toBe("stopped");
+    }),
+  );
+
+  it.effect("ignores malformed subagent payloads (no task events)", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-malformed");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "delegate", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-4",
+        toolName: "subagent",
+        args: {},
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_update",
+        toolCallId: "sa-4",
+        toolName: "subagent",
+        args: {},
+        partialResult: { content: [{ type: "text", text: "garbled" }] },
+      } as unknown as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "agent_end",
+        messages: [],
+        willRetry: false,
+      } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+      expect(events.some((e) => e.type.startsWith("task."))).toBe(false);
+      // the unrecognized payload still surfaces its text (not [object Object])
+      const delta = events.find((e) => e.type === "content.delta" && e.itemId === "sa-4");
+      expect(delta).toBeDefined();
+      if (delta?.type === "content.delta") {
+        expect(delta.payload.delta).toContain("garbled");
+      }
+    }),
+  );
+
+  it.effect("finalizes outstanding subagent tasks as stopped on interruption", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-subagent-interrupt");
+      const store = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+      const fiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Ref.update(store, (events) => [...events, event])),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "delegate", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "sa-5",
+        toolName: "subagent",
+        args: {},
+      } as AgentSessionEvent);
+      yield* fake.pushEvent(
+        subagentUpdate("sa-5", "single", [
+          subagentResult({
+            messages: [{ role: "assistant", content: [{ type: "text", text: "in progress" }] }],
+          }),
+        ]),
+      );
+      yield* Effect.yieldNow;
+      yield* adapter.interruptTurn(threadId);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(fiber);
+
+      const events = yield* Ref.get(store);
+      const started = events.filter((e) => e.type === "task.started");
+      const completed = events.filter((e) => e.type === "task.completed");
+      expect(started).toHaveLength(1);
+      expect(completed).toHaveLength(1);
+      if (completed[0]?.type === "task.completed") {
+        expect(completed[0].payload.status).toBe("stopped");
+        expect(completed[0].payload.taskId).toBe("pi-subagent:sa-5:0");
+      }
     }),
   );
 });

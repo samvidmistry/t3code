@@ -101,6 +101,12 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     capabilities: GPT_5_6_MODEL_CAPABILITIES,
   },
   {
+    slug: "gemini-3.6-flash",
+    name: "Gemini 3.6 Flash",
+    isCustom: false,
+    capabilities: GPT_5_6_MODEL_CAPABILITIES,
+  },
+  {
     slug: "claude-fable-5",
     name: "Claude Fable 5",
     isCustom: false,
@@ -420,6 +426,7 @@ export function normalizeClaudeCliEffort(
   if (
     effort === "xhigh" &&
     !model?.startsWith("gpt-5.6-") &&
+    model !== "gemini-3.6-flash" &&
     model !== "claude-fable-5" &&
     model !== "claude-opus-4-8" &&
     model !== "claude-sonnet-5"

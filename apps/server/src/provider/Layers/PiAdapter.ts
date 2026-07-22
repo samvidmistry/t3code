@@ -17,6 +17,7 @@ import {
   type ProviderUserInputAnswers,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
@@ -45,6 +46,16 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
+import {
+  normalizePiSubagentResult,
+  subagentChildCompletionSummary,
+  subagentChildFingerprint,
+  subagentChildHasActivity,
+  subagentChildProgressDescription,
+  subagentChildTaskId,
+  subagentChildTerminalStatus,
+  type NormalizedSubagentSnapshot,
+} from "./PiSubagentSnapshot.ts";
 import {
   type AgentSessionEvent,
   buildPiTurnCommand,
@@ -115,6 +126,15 @@ interface PiToolItem {
   args: unknown;
 }
 
+// Per child subagent task tracked against its parent `subagent` tool call.
+interface SubagentChildTaskState {
+  readonly taskId: RuntimeTaskId;
+  started: boolean;
+  completed: boolean;
+  // compact fingerprint of the last emitted snapshot (no transcript retained)
+  progressFingerprint: string | undefined;
+}
+
 interface PiTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
@@ -153,6 +173,8 @@ interface PiSessionContext {
   readonly sessionApprovals: Set<string>;
   turnState: PiTurnState | undefined;
   readonly turns: Array<{ id: TurnId; items: Array<PiToolItem> }>;
+  // parent `subagent` toolCallId -> child index -> child task state
+  readonly subagentTasks: Map<string, Map<number, SubagentChildTaskState>>;
   stopped: boolean;
   // slug the pi process is running; used to issue set_model only on change
   currentModel: string | undefined;
@@ -247,6 +269,45 @@ export function normalizePiTokenUsage(
       ? { compactsAutomatically: options.compactsAutomatically }
       : {}),
   };
+}
+
+// Extract human-readable text from a tool `partialResult`, which may be a raw
+// string or a structured `AgentToolResult` ({ content: [{ type: "text", text }] }).
+// Falls back to compact JSON so structured payloads never render as "[object Object]".
+export function extractPiPartialResultText(partial: unknown): string | undefined {
+  if (partial === undefined || partial === null) return undefined;
+  if (typeof partial === "string") return partial;
+  if (typeof partial === "number" || typeof partial === "boolean") return String(partial);
+  if (Array.isArray(partial)) {
+    const joined = partial
+      .map((entry) => extractPiPartialResultText(entry))
+      .filter((value): value is string => value !== undefined && value.length > 0)
+      .join("");
+    return joined.length > 0 ? joined : undefined;
+  }
+  if (typeof partial !== "object") return undefined;
+  const record = partial as Record<string, unknown>;
+  const content = record["content"];
+  if (Array.isArray(content)) {
+    let text = "";
+    for (const rawPart of content) {
+      if (rawPart && typeof rawPart === "object") {
+        const part = rawPart as Record<string, unknown>;
+        if (part["type"] === "text" && typeof part["text"] === "string") {
+          text += part["text"];
+        }
+      }
+    }
+    if (text.length > 0) return text;
+  }
+  if (typeof record["text"] === "string" && record["text"].length > 0) return record["text"];
+  if (typeof record["output"] === "string" && record["output"].length > 0) return record["output"];
+  try {
+    const serialized = JSON.stringify(partial);
+    return serialized && serialized !== "{}" ? serialized : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function summarizePiToolArgs(args: unknown): string | undefined {
@@ -397,6 +458,136 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     payload: unknown,
   ) => ({ raw: { source, method, payload } }) as const;
 
+  // Emit canonical task.* events for the child agents of a `subagent` tool call.
+  // On a non-final snapshot we only emit task.started / task.progress; final
+  // completion status comes from the terminal tool result (`final: true`).
+  const emitSubagentTaskEvents = (
+    context: PiSessionContext,
+    event: AgentSessionEvent & { readonly toolCallId: string; readonly toolName: string },
+    snapshot: NormalizedSubagentSnapshot,
+    final: boolean,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const turnState = context.turnState;
+      if (!turnState) return;
+      const toolCallId = event.toolCallId;
+      let parent = context.subagentTasks.get(toolCallId);
+      if (!parent) {
+        parent = new Map();
+        context.subagentTasks.set(toolCallId, parent);
+      }
+
+      for (const child of snapshot.children) {
+        let state = parent.get(child.index);
+        if (!state) {
+          state = {
+            taskId: RuntimeTaskId.make(subagentChildTaskId(toolCallId, child)),
+            started: false,
+            completed: false,
+            progressFingerprint: undefined,
+          };
+          parent.set(child.index, state);
+        }
+
+        if (!state.started) {
+          // Defer task.started for a not-yet-dispatched queued placeholder
+          // (parallel `exitCode === -1`, empty transcript, no usage). Start on
+          // its first observable activity, or immediately before completion.
+          if (!final && !subagentChildHasActivity(child)) continue;
+          state.started = true;
+          const stamp = yield* makeEventStamp();
+          const description = child.task.trim();
+          yield* offerRuntimeEvent({
+            ...stamp,
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            threadId: context.session.threadId,
+            turnId: turnState.turnId,
+            type: "task.started",
+            payload: {
+              taskId: state.taskId,
+              ...(description.length > 0 ? { description } : {}),
+              ...(child.agent.length > 0 ? { taskType: child.agent } : {}),
+            },
+            ...rawEvent("pi.rpc.event", event.type, event),
+          });
+        }
+
+        if (final) {
+          if (state.completed) continue;
+          state.completed = true;
+          const summary = subagentChildCompletionSummary(child);
+          const stamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            ...stamp,
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            threadId: context.session.threadId,
+            turnId: turnState.turnId,
+            type: "task.completed",
+            payload: {
+              taskId: state.taskId,
+              status: subagentChildTerminalStatus(child),
+              ...(summary ? { summary } : {}),
+              ...(child.usage ? { usage: child.usage } : {}),
+            },
+            ...rawEvent("pi.rpc.event", event.type, event),
+          });
+          continue;
+        }
+
+        const fingerprint = subagentChildFingerprint(child);
+        if (fingerprint === state.progressFingerprint) continue;
+        state.progressFingerprint = fingerprint;
+        const description = subagentChildProgressDescription(child);
+        if (!description) continue;
+        const stamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          ...stamp,
+          provider: PROVIDER,
+          providerInstanceId: boundInstanceId,
+          threadId: context.session.threadId,
+          turnId: turnState.turnId,
+          type: "task.progress",
+          payload: {
+            taskId: state.taskId,
+            description,
+            ...(child.lastToolName ? { lastToolName: child.lastToolName } : {}),
+            ...(child.usage ? { usage: child.usage } : {}),
+          },
+          ...rawEvent("pi.rpc.event", event.type, event),
+        });
+      }
+
+      if (final) context.subagentTasks.delete(toolCallId);
+    });
+
+  // Finalize any still-open child subagent tasks (e.g. on interruption / a
+  // failed or incomplete turn) and clear the tracker.
+  const finalizeSubagentTasks = (
+    context: PiSessionContext,
+    status: "completed" | "failed" | "stopped",
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      for (const [, parent] of context.subagentTasks) {
+        for (const [, state] of parent) {
+          if (state.completed) continue;
+          state.completed = true;
+          const stamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            ...stamp,
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            threadId: context.session.threadId,
+            ...(context.turnState ? { turnId: context.turnState.turnId } : {}),
+            type: "task.completed",
+            payload: { taskId: state.taskId, status },
+          });
+        }
+      }
+      context.subagentTasks.clear();
+    });
+
   const completeTurn = (
     context: PiSessionContext,
     state: "completed" | "failed" | "interrupted" | "cancelled",
@@ -405,6 +596,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     Effect.gen(function* () {
       const turnState = context.turnState;
       if (!turnState) return;
+      yield* finalizeSubagentTasks(
+        context,
+        state === "completed" ? "completed" : state === "failed" ? "failed" : "stopped",
+      );
       context.turnState = undefined;
       context.turns.push({ id: turnState.turnId, items: [...turnState.items] });
 
@@ -577,9 +772,25 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           const partial = (event as { partialResult?: unknown }).partialResult;
           if (partial === undefined) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
+
+          // The bundled `subagent` extension streams structured child snapshots;
+          // map recognized snapshots to canonical task.* events instead of text.
+          if (event.toolName === "subagent") {
+            const snapshot = normalizePiSubagentResult(partial);
+            if (snapshot) {
+              yield* emitSubagentTaskEvents(
+                context,
+                event as AgentSessionEvent & { toolCallId: string; toolName: string },
+                snapshot,
+                false,
+              );
+              return;
+            }
+          }
+
           const itemType = classifyPiToolItemType(event.toolName);
-          const delta = typeof partial === "string" ? partial : String(partial);
-          if (delta.length === 0) return;
+          const delta = extractPiPartialResultText(partial);
+          if (delta === undefined || delta.length === 0) return;
           yield* offerRuntimeEvent({
             ...base,
             turnId: context.turnState.turnId,
@@ -598,6 +809,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           if (!context.turnState) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
           const itemType = classifyPiToolItemType(event.toolName);
+
+          // Emit child subagent task completions (from the terminal result
+          // details) BEFORE the parent item.completed so consumers see task
+          // lifecycle close out under the still-open parent tool call.
+          if (event.toolName === "subagent") {
+            const snapshot = normalizePiSubagentResult((event as { result?: unknown }).result);
+            if (snapshot) {
+              yield* emitSubagentTaskEvents(
+                context,
+                event as AgentSessionEvent & { toolCallId: string; toolName: string },
+                snapshot,
+                true,
+              );
+            }
+          }
+
           const storedItem = context.turnState.items.find((item) => item.id === itemId);
           const detail = summarizePiToolArgs(storedItem?.args);
           const argsObj =
@@ -1096,6 +1323,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       sessionApprovals: new Set(),
       turnState: undefined,
       turns: [],
+      subagentTasks: new Map(),
       stopped: false,
       currentModel: modelSelection?.model,
       currentContextWindow: undefined,

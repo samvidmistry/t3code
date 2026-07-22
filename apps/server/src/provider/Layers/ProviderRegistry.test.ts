@@ -1560,6 +1560,16 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               },
             ]);
           }
+          const gemini36Flash = status.models.find((model) => model.slug === "gemini-3.6-flash");
+          assert.deepStrictEqual(
+            gemini36Flash && {
+              slug: gemini36Flash.slug,
+              name: gemini36Flash.name,
+              isCustom: gemini36Flash.isCustom,
+            },
+            { slug: "gemini-3.6-flash", name: "Gemini 3.6 Flash", isCustom: false },
+          );
+          assert.deepStrictEqual(gemini36Flash?.capabilities, gpt56Models[0]?.capabilities);
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args) => {

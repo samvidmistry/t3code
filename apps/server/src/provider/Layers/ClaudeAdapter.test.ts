@@ -542,6 +542,37 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("forwards Gemini 3.6 Flash model options to the Claude SDK", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "gemini-3.6-flash",
+          [
+            { id: "effort", value: "xhigh" },
+            { id: "fastMode", value: true },
+            { id: "contextWindow", value: "1m" },
+          ],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.model, "gemini-3.6-flash[1m]");
+      assert.equal(createInput?.options.effort, "xhigh");
+      assert.deepEqual(createInput?.options.settings, {
+        fastMode: true,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("falls back to default effort when unsupported max is requested for Sonnet 4.6", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

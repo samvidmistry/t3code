@@ -7,6 +7,7 @@ import {
   buildPiUserInputResponse,
   classifyPiApprovalRequestType,
   classifyPiToolItemType,
+  extractPiPartialResultText,
   isPiApprovalConfirmed,
   normalizePiTokenUsage,
   parseNumberedList,
@@ -201,5 +202,40 @@ describe("buildPiUserInputResponse", () => {
     expect(
       buildPiUserInputResponse({ piId: "ui-4", questionId: "q4", method: "editor" }, {}),
     ).toEqual({ type: "extension_ui_response", id: "ui-4", value: "" });
+  });
+});
+
+describe("extractPiPartialResultText", () => {
+  it("returns raw strings unchanged", () => {
+    expect(extractPiPartialResultText("hello")).toBe("hello");
+  });
+
+  it("extracts text parts from a structured AgentToolResult", () => {
+    expect(
+      extractPiPartialResultText({
+        content: [
+          { type: "text", text: "line 1\n" },
+          { type: "text", text: "line 2" },
+        ],
+        details: { mode: "single" },
+      }),
+    ).toBe("line 1\nline 2");
+  });
+
+  it("falls back to text / output fields", () => {
+    expect(extractPiPartialResultText({ text: "from text" })).toBe("from text");
+    expect(extractPiPartialResultText({ output: "from output" })).toBe("from output");
+  });
+
+  it("serializes structured objects instead of producing [object Object]", () => {
+    const result = extractPiPartialResultText({ foo: "bar", n: 1 });
+    expect(result).toBe('{"foo":"bar","n":1}');
+    expect(result).not.toContain("[object Object]");
+  });
+
+  it("returns undefined for empty / nullish payloads", () => {
+    expect(extractPiPartialResultText(undefined)).toBeUndefined();
+    expect(extractPiPartialResultText(null)).toBeUndefined();
+    expect(extractPiPartialResultText({})).toBeUndefined();
   });
 });
