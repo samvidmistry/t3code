@@ -138,8 +138,12 @@ const makeThreadWriter = Effect.fn("makeThreadWriter")(function* (input: {
     flush: Effect.fn("makeThreadWriter.flush")(function* (messages) {
       const flushResult = yield* Effect.sync(() => {
         try {
+          let chunk = "";
           for (const message of messages) {
-            sink.write(message);
+            chunk += message;
+          }
+          if (chunk.length > 0) {
+            sink.write(chunk);
           }
           return { ok: true as const };
         } catch (error) {

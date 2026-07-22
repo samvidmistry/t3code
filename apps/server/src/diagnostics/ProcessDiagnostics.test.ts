@@ -208,6 +208,7 @@ describe("ProcessDiagnostics", () => {
       const diagnostics = yield* Effect.service(ProcessDiagnostics.ProcessDiagnostics).pipe(
         Effect.flatMap((pd) => pd.read),
         Effect.provide(layer),
+        Effect.provideService(HostProcessPlatform, "linux"),
       );
 
       expect(diagnostics.processes.map((process) => process.pid)).toEqual([4242]);
@@ -217,6 +218,165 @@ describe("ProcessDiagnostics", () => {
           args: ["-axo", "pid=,ppid=,pgid=,stat=,pcpu=,rss=,etime=,command="],
         },
       ]);
+    }),
+  );
+
+  it.effect("queries Windows process and performance rows in bulk", () =>
+    Effect.gen(function* () {
+      const commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }> =
+        [];
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make((command) => {
+          const childProcess = command as unknown as {
+            readonly command: string;
+            readonly args: ReadonlyArray<string>;
+          };
+          commands.push({ command: childProcess.command, args: childProcess.args });
+          return Effect.succeed(
+            mockHandle({
+              stdout: JSON.stringify([
+                {
+                  ProcessId: 4242,
+                  ParentProcessId: 100,
+                  Name: "agent.exe",
+                  CommandLine: "agent.exe run",
+                  Status: "OK",
+                  WorkingSetSize: 2048,
+                  PercentProcessorTime: 12.5,
+                },
+                {
+                  ProcessId: 4243,
+                  ParentProcessId: 100,
+                  Name: "worker.exe",
+                  CommandLine: "worker.exe",
+                  Status: null,
+                  WorkingSetSize: 4096,
+                },
+              ]),
+            }),
+          );
+        }),
+      );
+
+      const rows = yield* ProcessDiagnostics.readProcessRows.pipe(
+        Effect.provide(spawnerLayer),
+        Effect.provideService(HostProcessPlatform, "win32"),
+      );
+
+      expect(rows).toEqual([
+        {
+          pid: 4242,
+          ppid: 100,
+          pgid: null,
+          status: "OK",
+          cpuPercent: 12.5,
+          rssBytes: 2048,
+          elapsed: "",
+          command: "agent.exe run",
+        },
+        {
+          pid: 4243,
+          ppid: 100,
+          pgid: null,
+          status: "Live",
+          cpuPercent: 0,
+          rssBytes: 4096,
+          elapsed: "",
+          command: "worker.exe",
+        },
+      ]);
+      expect(commands).toHaveLength(1);
+      expect(commands[0]?.command).toBe("powershell.exe");
+      expect(commands[0]?.args.slice(0, 3)).toEqual(["-NoProfile", "-NonInteractive", "-Command"]);
+
+      const script = commands[0]?.args[3] ?? "";
+      expect(script.match(/Get-CimInstance Win32_Process\b/g)).toHaveLength(1);
+      expect(
+        script.match(/Get-CimInstance Win32_PerfFormattedData_PerfProc_Process\b/g),
+      ).toHaveLength(1);
+      expect(script).not.toContain("-Filter");
+      expect(script).toContain("$perfByPid.ContainsKey($perfPid)");
+      expect(script).toContain("$perfByPid[$processPid]");
+    }),
+  );
+
+  it.effect("normalizes singleton Windows process output", () =>
+    Effect.gen(function* () {
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() =>
+          Effect.succeed(
+            mockHandle({
+              stdout: JSON.stringify({
+                ProcessId: 4242,
+                ParentProcessId: 100,
+                Name: "agent.exe",
+                CommandLine: "",
+                Status: null,
+                WorkingSetSize: 2048,
+                PercentProcessorTime: 1.5,
+              }),
+            }),
+          ),
+        ),
+      );
+
+      const rows = yield* ProcessDiagnostics.readProcessRows.pipe(
+        Effect.provide(spawnerLayer),
+        Effect.provideService(HostProcessPlatform, "win32"),
+      );
+
+      expect(rows).toEqual([
+        {
+          pid: 4242,
+          ppid: 100,
+          pgid: null,
+          status: "Live",
+          cpuPercent: 1.5,
+          rssBytes: 2048,
+          elapsed: "",
+          command: "agent.exe",
+        },
+      ]);
+    }),
+  );
+
+  it.effect("keeps bounded command diagnostics when the Windows process query fails", () =>
+    Effect.gen(function* () {
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() =>
+          Effect.succeed(
+            mockHandle({
+              code: 17,
+              stdout: "partial process output",
+              stderr: "process access denied",
+            }),
+          ),
+        ),
+      );
+
+      const error = yield* ProcessDiagnostics.readProcessRows.pipe(
+        Effect.provide(spawnerLayer),
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "ProcessDiagnosticsQueryFailedError",
+        command: "powershell.exe",
+        argCount: 4,
+        cwd: process.cwd(),
+        exitCode: 17,
+        stdoutBytes: 22,
+        stderrBytes: 21,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      });
+      expect(error.message).toBe(
+        `Process diagnostics query 'powershell.exe' failed with exit code 17 in '${process.cwd()}'.`,
+      );
     }),
   );
 
