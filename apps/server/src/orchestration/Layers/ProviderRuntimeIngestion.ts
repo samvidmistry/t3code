@@ -308,6 +308,31 @@ function sessionStatusAllowsActiveTurn(
   return status === "starting" || status === "running";
 }
 
+// Preserve the provider's runtime item id on each lifecycle activity. This
+// lets clients replace an in-progress tool row with its later update/completion
+// rather than waiting to render the tool until it has finished.
+function toolActivityData(
+  event: Extract<
+    ProviderRuntimeEvent,
+    { type: "item.started" | "item.updated" | "item.completed" }
+  >,
+): unknown {
+  if (event.itemId === undefined) return event.payload.data;
+  const toolCallId = String(event.itemId);
+  const data = event.payload.data;
+  if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+    const record = data as Record<string, unknown>;
+    return {
+      ...record,
+      ...(record["toolCallId"] !== undefined ? {} : { toolCallId }),
+    };
+  }
+  return {
+    ...(data !== undefined ? { item: data } : {}),
+    toolCallId,
+  };
+}
+
 function requestKindFromCanonicalRequestType(
   requestType: string | undefined,
 ): "command" | "file-read" | "file-change" | undefined {
@@ -676,7 +701,9 @@ export function runtimeEventToActivities(
             ...(event.payload.title ? { title: event.payload.title } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
-            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+            ...(event.payload.data !== undefined || event.itemId !== undefined
+              ? { data: toolActivityData(event) }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -700,7 +727,9 @@ export function runtimeEventToActivities(
             ...(event.payload.title ? { title: event.payload.title } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
-            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+            ...(event.payload.data !== undefined || event.itemId !== undefined
+              ? { data: toolActivityData(event) }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -724,7 +753,9 @@ export function runtimeEventToActivities(
             ...(event.payload.title ? { title: event.payload.title } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
-            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+            ...(event.payload.data !== undefined || event.itemId !== undefined
+              ? { data: toolActivityData(event) }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

@@ -461,6 +461,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   // Emit canonical task.* events for the child agents of a `subagent` tool call.
   // On a non-final snapshot we only emit task.started / task.progress; final
   // completion status comes from the terminal tool result (`final: true`).
+  // Do not attach `rawEvent`: Pi's cumulative snapshot carries full child
+  // transcripts, which would otherwise be persisted once per progress update.
   const emitSubagentTaskEvents = (
     context: PiSessionContext,
     event: AgentSessionEvent & { readonly toolCallId: string; readonly toolName: string },
@@ -509,7 +511,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               ...(description.length > 0 ? { description } : {}),
               ...(child.agent.length > 0 ? { taskType: child.agent } : {}),
             },
-            ...rawEvent("pi.rpc.event", event.type, event),
           });
         }
 
@@ -531,7 +532,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               ...(summary ? { summary } : {}),
               ...(child.usage ? { usage: child.usage } : {}),
             },
-            ...rawEvent("pi.rpc.event", event.type, event),
           });
           continue;
         }
@@ -555,7 +555,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             ...(child.lastToolName ? { lastToolName: child.lastToolName } : {}),
             ...(child.usage ? { usage: child.usage } : {}),
           },
-          ...rawEvent("pi.rpc.event", event.type, event),
         });
       }
 
@@ -759,9 +758,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "item.started",
             payload: {
               itemType,
+              status: "inProgress",
               title: event.toolName,
               ...(detail ? { detail } : {}),
-              ...(argsObj ? { data: { toolName: event.toolName, input: argsObj } } : {}),
+              ...(argsObj ? { data: { item: { toolName: event.toolName, input: argsObj } } } : {}),
             },
           });
           return;
@@ -841,7 +841,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               title: event.toolName,
               status: event.isError ? "failed" : "completed",
               ...(detail ? { detail } : {}),
-              ...(argsObj ? { data: { toolName: event.toolName, input: argsObj } } : {}),
+              ...(argsObj ? { data: { item: { toolName: event.toolName, input: argsObj } } } : {}),
             },
           });
           return;

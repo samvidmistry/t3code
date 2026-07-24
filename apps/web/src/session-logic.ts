@@ -637,7 +637,14 @@ export function deriveWorkLogEntries(
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
-    if (activity.kind === "tool.started") continue;
+    // Old activity records do not carry a runtime item id, so they cannot be
+    // reconciled with a later completion and would duplicate the row. New
+    // lifecycle activities include one and can appear immediately as running.
+    const payload =
+      activity.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    if (activity.kind === "tool.started" && !extractToolCallId(payload)) continue;
     if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
@@ -752,6 +759,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     entry.toolCallId = toolCallId;
   }
   let toolLifecycleStatus = extractWorkLogToolLifecycleStatus(payload);
+  if (!toolLifecycleStatus && activity.kind === "tool.started") {
+    toolLifecycleStatus = "inProgress";
+  }
   if (!toolLifecycleStatus && activity.kind === "tool.completed") {
     toolLifecycleStatus = "completed";
   }
@@ -775,6 +785,24 @@ function collapseDerivedWorkLogEntries(
       collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
       continue;
     }
+
+    // Progress from a delegated task can arrive between its parent tool's start
+    // and completion. Correlate by runtime item id instead of requiring those
+    // lifecycle activities to be adjacent.
+    if (entry.toolCallId) {
+      const matchingIndex = collapsed.findLastIndex(
+        (candidate) =>
+          candidate.toolCallId === entry.toolCallId && candidate.activityKind !== "tool.completed",
+      );
+      if (matchingIndex >= 0) {
+        const matching = collapsed[matchingIndex];
+        if (matching && shouldCollapseToolLifecycleEntries(matching, entry)) {
+          collapsed[matchingIndex] = mergeDerivedWorkLogEntries(matching, entry);
+          continue;
+        }
+      }
+    }
+
     collapsed.push(entry);
   }
   return collapsed;
@@ -784,10 +812,18 @@ function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
-  if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
+  if (
+    previous.activityKind !== "tool.started" &&
+    previous.activityKind !== "tool.updated" &&
+    previous.activityKind !== "tool.completed"
+  ) {
     return false;
   }
-  if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
+  if (
+    next.activityKind !== "tool.started" &&
+    next.activityKind !== "tool.updated" &&
+    next.activityKind !== "tool.completed"
+  ) {
     return false;
   }
   if (previous.activityKind === "tool.completed") {
@@ -849,7 +885,11 @@ function mergeChangedFiles(
 }
 
 function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | undefined {
-  if (entry.activityKind !== "tool.updated" && entry.activityKind !== "tool.completed") {
+  if (
+    entry.activityKind !== "tool.started" &&
+    entry.activityKind !== "tool.updated" &&
+    entry.activityKind !== "tool.completed"
+  ) {
     return undefined;
   }
   if (entry.toolCallId) {

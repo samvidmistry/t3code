@@ -231,6 +231,10 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
           e.type === "task.progress" ? [e.payload.description] : [],
         );
         expect(descriptions).toEqual(["aaaa", "bbbb", "Using read", "Ran read", "Ran read"]);
+        // Pi's raw subagent snapshots contain cumulative child transcripts, so
+        // canonical task events must remain compact and transcript-free.
+        const taskEvents = events.filter((event) => event.type.startsWith("task."));
+        expect(taskEvents.some((event) => "raw" in event)).toBe(false);
         // the tool-call progress carries the resolved lastToolName
         const usingRead = progress.find(
           (e) => e.type === "task.progress" && e.payload.description === "Using read",
@@ -596,6 +600,15 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       expect(completed).toBeDefined();
       if (started && started.type === "item.started") {
         expect(started.payload.itemType).toBe("command_execution");
+        expect(started.payload.status).toBe("inProgress");
+        expect(started.payload.data).toEqual({
+          item: { toolName: "bash", input: { command: "ls" } },
+        });
+      }
+      if (completed && completed.type === "item.completed") {
+        expect(completed.payload.data).toEqual({
+          item: { toolName: "bash", input: { command: "ls" } },
+        });
       }
     }),
   );

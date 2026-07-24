@@ -694,24 +694,53 @@ describe("workEntryIndicatesToolFailure", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
-  it("omits tool started entries and keeps completed entries", () => {
-    const activities: OrchestrationThreadActivity[] = [
-      makeActivity({
-        id: "tool-complete",
-        createdAt: "2026-02-23T00:00:03.000Z",
-        summary: "Tool call complete",
-        kind: "tool.completed",
-      }),
-      makeActivity({
-        id: "tool-start",
-        createdAt: "2026-02-23T00:00:02.000Z",
-        summary: "Tool call",
-        kind: "tool.started",
-      }),
-    ];
+  it("shows a correlated tool start immediately and replaces it on completion", () => {
+    const started = makeActivity({
+      id: "tool-start",
+      createdAt: "2026-02-23T00:00:02.000Z",
+      summary: "Bash started",
+      kind: "tool.started",
+      payload: {
+        itemType: "command_execution",
+        title: "Bash",
+        status: "inProgress",
+        data: { toolCallId: "call-1", item: { command: "sleep 30" } },
+      },
+    });
+    const completed = makeActivity({
+      id: "tool-complete",
+      createdAt: "2026-02-23T00:00:03.000Z",
+      summary: "Bash",
+      kind: "tool.completed",
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        data: { toolCallId: "call-1", item: { command: "sleep 30" } },
+      },
+    });
 
-    const entries = deriveWorkLogEntries(activities);
-    expect(entries.map((entry) => entry.id)).toEqual(["tool-complete"]);
+    const running = deriveWorkLogEntries([started]);
+    expect(running).toHaveLength(1);
+    expect(running[0]).toMatchObject({
+      id: "tool-start",
+      toolLifecycleStatus: "inProgress",
+      command: "sleep 30",
+    });
+
+    const interleavedProgress = makeActivity({
+      id: "task-progress",
+      createdAt: "2026-02-23T00:00:02.500Z",
+      kind: "task.progress",
+      summary: "Child agent is working",
+      payload: { taskId: "child-1", detail: "Child agent is working" },
+    });
+    const settled = deriveWorkLogEntries([started, interleavedProgress, completed]);
+    expect(settled).toHaveLength(2);
+    expect(settled[0]).toMatchObject({
+      id: "tool-complete",
+      toolLifecycleStatus: "completed",
+      command: "sleep 30",
+    });
   });
 
   it("omits task.started but shows task.progress and task.completed", () => {
