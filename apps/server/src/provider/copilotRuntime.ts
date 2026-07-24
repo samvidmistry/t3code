@@ -53,6 +53,7 @@ const COPILOT_FEATURE_FLAGS_ENV = "COPILOT_FEATURE_FLAGS";
 const COPILOT_SHELL_SPAWN_BACKEND_FLAG = "SHELL_SPAWN_BACKEND";
 const COPILOT_SHELL_SPAWN_BACKEND_EXP_ENV = "COPILOT_EXP_COPILOT_CLI_SHELL_SPAWN_BACKEND";
 const COPILOT_POSIX_SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh"] as const;
+const COPILOT_GRACEFUL_STOP_TIMEOUT = "5 seconds";
 
 export class CopilotProbePromiseError extends Schema.TaggedErrorClass<CopilotProbePromiseError>()(
   "CopilotProbePromiseError",
@@ -64,6 +65,73 @@ export class CopilotProbePromiseError extends Schema.TaggedErrorClass<CopilotPro
     return "Copilot probe promise failed.";
   }
 }
+
+export class CopilotClientStopError extends Schema.TaggedErrorClass<CopilotClientStopError>()(
+  "CopilotClientStopError",
+  {
+    cleanupErrors: Schema.Array(Schema.Defect()),
+    stopCause: Schema.optional(Schema.Defect()),
+    forceStopCause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    const gracefulStopFailures = this.stopCause === undefined ? 0 : 1;
+    const forceStopFailures = this.forceStopCause === undefined ? 0 : 1;
+    return `Copilot client cleanup was incomplete (cleanupErrors=${this.cleanupErrors.length}, gracefulStopFailures=${gracefulStopFailures}, forceStopFailures=${forceStopFailures}).`;
+  }
+}
+
+class CopilotClientStopPromiseError extends Schema.TaggedErrorClass<CopilotClientStopPromiseError>()(
+  "CopilotClientStopPromiseError",
+  {
+    operation: Schema.Literals(["stop", "forceStop"]),
+    cause: Schema.Defect(),
+  },
+) {}
+
+export const stopCopilotClient = Effect.fn("stopCopilotClient")(function* (
+  client: Pick<CopilotClient, "stop" | "forceStop">,
+) {
+  const stopAttempt = yield* Effect.tryPromise({
+    try: () => client.stop(),
+    catch: (cause) => new CopilotClientStopPromiseError({ operation: "stop", cause }),
+  }).pipe(
+    Effect.match({
+      onFailure: (error) => ({ _tag: "Rejected" as const, cause: error.cause }),
+      onSuccess: (cleanupErrors) => ({ _tag: "Resolved" as const, cleanupErrors }),
+    }),
+    Effect.timeoutOrElse({
+      duration: COPILOT_GRACEFUL_STOP_TIMEOUT,
+      orElse: () =>
+        Effect.succeed({
+          _tag: "Rejected" as const,
+          cause: new Error(
+            `Graceful Copilot client stop timed out after ${COPILOT_GRACEFUL_STOP_TIMEOUT}.`,
+          ),
+        }),
+    }),
+  );
+
+  if (stopAttempt._tag === "Resolved" && stopAttempt.cleanupErrors.length === 0) {
+    return;
+  }
+
+  const forceStopAttempt = yield* Effect.tryPromise({
+    try: () => client.forceStop(),
+    catch: (cause) => new CopilotClientStopPromiseError({ operation: "forceStop", cause }),
+  }).pipe(
+    Effect.match({
+      onFailure: (error) => ({ _tag: "Rejected" as const, cause: error.cause }),
+      onSuccess: () => ({ _tag: "Resolved" as const }),
+    }),
+  );
+
+  return yield* new CopilotClientStopError({
+    cleanupErrors: stopAttempt._tag === "Resolved" ? stopAttempt.cleanupErrors : [],
+    ...(stopAttempt._tag === "Rejected" ? { stopCause: stopAttempt.cause } : {}),
+    ...(forceStopAttempt._tag === "Rejected" ? { forceStopCause: forceStopAttempt.cause } : {}),
+  });
+});
 
 class CopilotCliPathResolutionError extends Schema.TaggedErrorClass<CopilotCliPathResolutionError>()(
   "CopilotCliPathResolutionError",
@@ -375,6 +443,28 @@ export const buildCopilotClientOptions = Effect.fn("buildCopilotClientOptions")(
   readonly onListModels?: CopilotClientOptions["onListModels"];
 }): Effect.fn.Return<CopilotClientOptions, CopilotCliPathResolutionError> {
   const cliUrl = trimOrUndefined(input.settings.serverUrl);
+  if (cliUrl) {
+    const connection = yield* Effect.try({
+      try: () => {
+        if (!URL.canParse(cliUrl)) {
+          throw new TypeError("Invalid Copilot server URL.");
+        }
+        return RuntimeConnection.forUri(cliUrl);
+      },
+      catch: (cause) =>
+        copilotClientConfigurationError({
+          settings: input.settings,
+          detail: "The configured Copilot server URL is invalid.",
+          cause,
+        }),
+    });
+    return {
+      connection,
+      ...(input.logLevel ? { logLevel: input.logLevel } : {}),
+      ...(input.onListModels ? { onListModels: input.onListModels } : {}),
+    };
+  }
+
   let env: Record<string, string | undefined> = { ...process.env };
 
   if (input.env) {
@@ -392,32 +482,17 @@ export const buildCopilotClientOptions = Effect.fn("buildCopilotClientOptions")(
     env,
     platform: input.platform,
   });
-  const bundledCliPath =
-    !cliUrl && !configuredCliPath
-      ? yield* resolveBundledCopilotCliPath({
-          ...(input.cwd ? { cwd: input.cwd } : {}),
-          env,
-          platform: input.platform,
-        })
-      : undefined;
-  const cliPath = configuredCliPath ?? bundledCliPath;
-  const connection = cliUrl
-    ? yield* Effect.try({
-        try: () => RuntimeConnection.forUri(cliUrl),
-        catch: (cause) =>
-          copilotClientConfigurationError({
-            settings: input.settings,
-            detail: "Invalid Copilot server URL.",
-            cause,
-          }),
+  const bundledCliPath = !configuredCliPath
+    ? yield* resolveBundledCopilotCliPath({
+        ...(input.cwd ? { cwd: input.cwd } : {}),
+        env,
+        platform: input.platform,
       })
-    : cliPath
-      ? RuntimeConnection.forStdio({ path: cliPath })
-      : undefined;
+    : undefined;
+  const cliPath = configuredCliPath ?? bundledCliPath;
 
   return {
-    ...(connection ? { connection } : {}),
-    mode: "copilot-cli",
+    ...(cliPath ? { connection: RuntimeConnection.forStdio({ path: cliPath }) } : {}),
     ...(input.cwd ? { workingDirectory: input.cwd } : {}),
     ...(input.baseDirectory ? { baseDirectory: input.baseDirectory } : {}),
     env,

@@ -5,6 +5,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import { ServerConfig } from "../config.ts";
@@ -17,6 +18,7 @@ const runtimeMock = vi.hoisted(() => {
       readonly client: {
         readonly start: ReturnType<typeof vi.fn>;
         readonly stop: ReturnType<typeof vi.fn>;
+        readonly forceStop: ReturnType<typeof vi.fn>;
         readonly createSession: ReturnType<typeof vi.fn>;
       };
     }>,
@@ -26,6 +28,12 @@ const runtimeMock = vi.hoisted(() => {
       readonly sendAndWait: ReturnType<typeof vi.fn>;
     }>,
     clientStartGate: null as Promise<void> | null,
+    clientStartError: null as Error | null,
+    stopErrors: [] as Error[],
+    responseContent: {
+      subject: "Add change",
+      body: "",
+    } as Record<string, unknown>,
   };
 
   return {
@@ -35,6 +43,12 @@ const runtimeMock = vi.hoisted(() => {
       state.sessionConfigs = [];
       state.sessions = [];
       state.clientStartGate = null;
+      state.clientStartError = null;
+      state.stopErrors = [];
+      state.responseContent = {
+        subject: "Add change",
+        body: "",
+      };
     },
   };
 });
@@ -50,16 +64,17 @@ vi.mock("../provider/copilotRuntime.ts", async () => {
       (input: { readonly cwd?: string; readonly baseDirectory?: string }) => {
         const start = vi.fn(async () => {
           await runtimeMock.state.clientStartGate;
+          if (runtimeMock.state.clientStartError) {
+            throw runtimeMock.state.clientStartError;
+          }
         });
-        const stop = vi.fn(async () => undefined);
+        const stop = vi.fn(async () => runtimeMock.state.stopErrors);
+        const forceStop = vi.fn(async () => undefined);
         const createSession = vi.fn(async (config: unknown) => {
           runtimeMock.state.sessionConfigs.push(config);
           const sendAndWait = vi.fn(async () => ({
             data: {
-              content: JSON.stringify({
-                subject: "Add change",
-                body: "",
-              }),
+              content: JSON.stringify(runtimeMock.state.responseContent),
             },
           }));
           const disconnect = vi.fn(async () => undefined);
@@ -73,6 +88,7 @@ vi.mock("../provider/copilotRuntime.ts", async () => {
         const client = {
           start,
           stop,
+          forceStop,
           createSession,
         };
         runtimeMock.state.createdClients.push({ input, client });
@@ -175,6 +191,76 @@ it.layer(CopilotTextGenerationTestLayer)("CopilotTextGeneration", (it) => {
     }),
   );
 
+  it.effect("stops failed clients and allows a later Copilot startup retry", () =>
+    Effect.gen(function* () {
+      const textGeneration = yield* makeCopilotTextGeneration(defaultCopilotSettings);
+      const modelSelection = createModelSelection(ProviderInstanceId.make("copilot"), "gpt-4.1");
+      runtimeMock.state.clientStartError = new Error("Copilot startup failed");
+      const request = () =>
+        textGeneration.generateCommitMessage({
+          cwd: process.cwd(),
+          branch: "feature/copilot-startup-failure",
+          stagedSummary: "M README.md",
+          stagedPatch: "diff --git a/README.md b/README.md",
+          modelSelection,
+        });
+
+      const firstResult = yield* request().pipe(Effect.result);
+      expect(firstResult._tag).toBe("Failure");
+      expect(runtimeMock.state.createdClients).toHaveLength(1);
+      expect(runtimeMock.state.createdClients[0]?.client.stop).toHaveBeenCalledOnce();
+
+      runtimeMock.state.clientStartError = null;
+      const retry = yield* request();
+      expect(retry.subject).toBe("Add change");
+      expect(runtimeMock.state.createdClients).toHaveLength(2);
+      expect(runtimeMock.state.createdClients[1]?.client.start).toHaveBeenCalledOnce();
+    }),
+  );
+
+  it.effect("unblocks waiters and cleans up when shared Copilot startup is interrupted", () =>
+    Effect.gen(function* () {
+      const textGeneration = yield* makeCopilotTextGeneration(defaultCopilotSettings);
+      const modelSelection = createModelSelection(ProviderInstanceId.make("copilot"), "gpt-4.1");
+      let releaseClientStart!: () => void;
+      runtimeMock.state.clientStartGate = new Promise<void>((resolve) => {
+        releaseClientStart = resolve;
+      });
+      const request = () =>
+        textGeneration.generateCommitMessage({
+          cwd: process.cwd(),
+          branch: "feature/copilot-startup-interruption",
+          stagedSummary: "M README.md",
+          stagedPatch: "diff --git a/README.md b/README.md",
+          modelSelection,
+        });
+
+      const startingFiber = yield* request().pipe(Effect.forkChild);
+      for (
+        let attempt = 0;
+        attempt < 20 && runtimeMock.state.createdClients.length === 0;
+        attempt += 1
+      ) {
+        yield* Effect.yieldNow;
+      }
+      expect(runtimeMock.state.createdClients).toHaveLength(1);
+
+      const waitingFiber = yield* request().pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(startingFiber);
+      const waitingResult = yield* Fiber.join(waitingFiber);
+
+      expect(waitingResult._tag).toBe("Failure");
+      expect(runtimeMock.state.createdClients[0]?.client.stop).toHaveBeenCalledOnce();
+
+      runtimeMock.state.clientStartGate = null;
+      releaseClientStart();
+      const retry = yield* request();
+      expect(retry.subject).toBe("Add change");
+      expect(runtimeMock.state.createdClients).toHaveLength(2);
+    }),
+  );
+
   it.effect("passes the configured Copilot base directory to shared clients", () =>
     Effect.gen(function* () {
       const textGeneration = yield* makeCopilotTextGeneration(defaultCopilotSettings, process.env, {
@@ -216,15 +302,41 @@ it.layer(CopilotTextGenerationTestLayer)("CopilotTextGeneration", (it) => {
           model: "gpt-4.1",
           reasoningEffort: "high",
           contextTier: "long_context",
+          infiniteSessions: { enabled: false },
         },
       ]);
     }),
   );
 
-  it.effect("generates local thread title fallbacks without starting a Copilot SDK session", () =>
+  it.effect("force stops an idle shared client after incomplete graceful cleanup", () =>
     Effect.gen(function* () {
       const textGeneration = yield* makeCopilotTextGeneration(defaultCopilotSettings);
       const modelSelection = createModelSelection(ProviderInstanceId.make("copilot"), "gpt-4.1");
+      runtimeMock.state.stopErrors = [new Error("text client cleanup failed")];
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/copilot-cleanup",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection,
+      });
+      yield* TestClock.adjust("30 seconds");
+      yield* Effect.yieldNow;
+
+      const client = runtimeMock.state.createdClients[0]?.client;
+      expect(client?.stop).toHaveBeenCalledOnce();
+      expect(client?.forceStop).toHaveBeenCalledOnce();
+    }),
+  );
+
+  it.effect("generates summarized thread titles through Copilot", () =>
+    Effect.gen(function* () {
+      const textGeneration = yield* makeCopilotTextGeneration(defaultCopilotSettings);
+      const modelSelection = createModelSelection(ProviderInstanceId.make("copilot"), "gpt-4.1");
+      runtimeMock.state.responseContent = {
+        title: "Fix reconnect startup",
+      };
 
       const result = yield* textGeneration.generateThreadTitle({
         cwd: process.cwd(),
@@ -232,9 +344,17 @@ it.layer(CopilotTextGenerationTestLayer)("CopilotTextGeneration", (it) => {
         modelSelection,
       });
 
-      expect(result.title).toBe("Investigate Copilot thread startup errors after...");
-      expect(runtimeMock.state.createdClients).toHaveLength(0);
-      expect(runtimeMock.state.sessions).toHaveLength(0);
+      expect(result.title).toBe("Fix reconnect startup");
+      expect(runtimeMock.state.createdClients).toHaveLength(1);
+      expect(runtimeMock.state.sessions).toHaveLength(1);
+      expect(runtimeMock.state.sessions[0]?.sendAndWait).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: expect.stringContaining(
+            "Title should summarize the user's request, not restate it verbatim.",
+          ),
+        }),
+        180_000,
+      );
     }),
   );
 });
