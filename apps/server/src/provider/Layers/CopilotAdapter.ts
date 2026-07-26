@@ -455,6 +455,10 @@ function permissionAutoApprovedByRuntimeMode(
     case "full-access":
       return true;
     case "auto-accept-edits":
+    // Copilot has no AI approvals reviewer, so `auto` degrades to the closest
+    // supported behaviour: the workspace-write grant it shares with
+    // `auto-accept-edits`, with everything else still routed for approval.
+    case "auto":
       return request.kind === "write";
     case "approval-required":
       return false;

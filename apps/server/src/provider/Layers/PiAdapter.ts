@@ -94,12 +94,17 @@ const PI_MODEL_OPTIONS_TIMEOUT_MS = 5_000;
 const PI_APPROVAL_SENTINEL_COMMAND = "t3-approval-gate";
 
 // like Claude/Cursor: full-access runs ungated; approval-required and
-// auto-accept-edits gate via the bundled extension (Pi has no native per-tool approval)
+// auto-accept-edits gate via the bundled extension (Pi has no native per-tool approval).
+// `auto` has no AI reviewer here either, so it gates with auto-accept-edits semantics
+// rather than falling through to ungated execution.
 function approvalGateForRuntimeMode(
   runtimeMode: ProviderSession["runtimeMode"],
 ): { readonly gate: false } | { readonly gate: true; readonly mode: string } {
   if (runtimeMode === "approval-required" || runtimeMode === "auto-accept-edits") {
     return { gate: true, mode: runtimeMode };
+  }
+  if (runtimeMode === "auto") {
+    return { gate: true, mode: "auto-accept-edits" };
   }
   return { gate: false };
 }
