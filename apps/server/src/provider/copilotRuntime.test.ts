@@ -17,6 +17,7 @@ import {
   authSnapshotFromCopilotSdk,
   buildCopilotClientOptions,
   capabilitiesFromCopilotModel,
+  copilotCliArgsForCommandPath,
   createCopilotClient,
   formatCopilotProbeError,
   modelsFromCopilotSdk,
@@ -28,6 +29,17 @@ import {
 function assertStdioConnection(connection: CopilotClientOptions["connection"]) {
   NodeAssert.equal(connection?.kind, "stdio");
   return connection;
+}
+
+function createExecutableFixture(name: string): {
+  readonly directory: string;
+  readonly path: string;
+} {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "copilot-cli-fixture-"));
+  const path = NodePath.join(directory, name);
+  NodeFS.writeFileSync(path, "#!/bin/sh\nexit 0\n");
+  NodeFS.chmodSync(path, 0o755);
+  return { directory, path };
 }
 
 const POSIX_SHELL_FALLBACKS = ["/bin/bash", "/usr/bin/bash", "/bin/sh"] as const;
@@ -342,6 +354,30 @@ describe("buildCopilotClientOptions", () => {
     NodeAssert.equal(env.COPILOT_EXP_COPILOT_CLI_SHELL_SPAWN_BACKEND, undefined);
   });
 
+  describe("copilotCliArgsForCommandPath", () => {
+    it("appends the copilot subcommand for the Agency CLI", () => {
+      NodeAssert.deepStrictEqual(copilotCliArgsForCommandPath("/usr/local/bin/agency", "darwin"), [
+        "copilot",
+        "--continue",
+      ]);
+      NodeAssert.deepStrictEqual(
+        copilotCliArgsForCommandPath("C:\\Program Files\\Agency\\agency.exe", "win32"),
+        ["copilot", "--continue"],
+      );
+    });
+
+    it("passes no subcommand for the Copilot CLI", () => {
+      NodeAssert.deepStrictEqual(
+        copilotCliArgsForCommandPath("/repo/node_modules/.bin/copilot", "darwin"),
+        [],
+      );
+      NodeAssert.deepStrictEqual(
+        copilotCliArgsForCommandPath("C:\\repo\\node_modules\\.bin\\copilot.cmd", "win32"),
+        [],
+      );
+    });
+  });
+
   it.layer(NodeServices.layer)("Copilot CLI command resolution", (it) => {
     it.effect(
       "strips inherited COPILOT_CLI_PATH and uses the local Copilot CLI shim by default",
@@ -385,6 +421,73 @@ describe("buildCopilotClientOptions", () => {
         });
 
         NodeAssert.ok(cliPath?.includes("node_modules/.bin/copilot"));
+      }),
+    );
+
+    it.effect("starts Copilot through the Agency CLI when it is available on PATH", () =>
+      Effect.gen(function* () {
+        const agency = createExecutableFixture("agency");
+
+        const options = yield* buildCopilotClientOptions({
+          settings: {
+            enabled: true,
+            binaryPath: "",
+            serverUrl: "",
+            customModels: [],
+          },
+          cwd: "/tmp/project",
+          env: { PATH: agency.directory },
+          platform: "darwin",
+        });
+
+        const connection = assertStdioConnection(options.connection);
+        NodeAssert.equal(connection.path, agency.path);
+        NodeAssert.deepStrictEqual(connection.args, ["copilot", "--continue"]);
+        NodeFS.rmSync(agency.directory, { recursive: true, force: true });
+      }),
+    );
+
+    it.effect("passes the copilot subcommand for a configured Agency CLI binary path", () =>
+      Effect.gen(function* () {
+        const agency = createExecutableFixture("agency");
+
+        const options = yield* buildCopilotClientOptions({
+          settings: {
+            enabled: true,
+            binaryPath: agency.path,
+            serverUrl: "",
+            customModels: [],
+          },
+          env: { PATH: "/usr/bin" },
+          platform: "darwin",
+        });
+
+        const connection = assertStdioConnection(options.connection);
+        NodeAssert.equal(connection.path, agency.path);
+        NodeAssert.deepStrictEqual(connection.args, ["copilot", "--continue"]);
+        NodeFS.rmSync(agency.directory, { recursive: true, force: true });
+      }),
+    );
+
+    it.effect("does not pass a subcommand for a configured Copilot CLI binary path", () =>
+      Effect.gen(function* () {
+        const copilot = createExecutableFixture("copilot");
+
+        const options = yield* buildCopilotClientOptions({
+          settings: {
+            enabled: true,
+            binaryPath: copilot.path,
+            serverUrl: "",
+            customModels: [],
+          },
+          env: { PATH: "/usr/bin" },
+          platform: "darwin",
+        });
+
+        const connection = assertStdioConnection(options.connection);
+        NodeAssert.equal(connection.path, copilot.path);
+        NodeAssert.equal(connection.args, undefined);
+        NodeFS.rmSync(copilot.directory, { recursive: true, force: true });
       }),
     );
 

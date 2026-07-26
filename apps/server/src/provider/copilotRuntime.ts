@@ -49,6 +49,13 @@ const GENERIC_EFFECT_TRY_PROMISE_MESSAGES = new Set([
 ]);
 const COPILOT_CLI_PATH_ENV = "COPILOT_CLI_PATH";
 const COPILOT_CLI_COMMAND = "copilot";
+const AGENCY_CLI_COMMAND = "agency";
+// Agency launches Copilot through its `copilot` subcommand. Without a
+// session-control flag Agency injects `--session-id <uuid>` for its own session
+// monitoring, which the Copilot CLI rejects together with the `--headless` flag
+// the SDK always passes. `--continue` suppresses that injection and is inert in
+// server mode, so the SDK keeps full control over session creation and resume.
+const AGENCY_COPILOT_ARGS: ReadonlyArray<string> = [COPILOT_CLI_COMMAND, "--continue"];
 const COPILOT_FEATURE_FLAGS_ENV = "COPILOT_FEATURE_FLAGS";
 const COPILOT_SHELL_SPAWN_BACKEND_FLAG = "SHELL_SPAWN_BACKEND";
 const COPILOT_SHELL_SPAWN_BACKEND_EXP_ENV = "COPILOT_EXP_COPILOT_CLI_SHELL_SPAWN_BACKEND";
@@ -432,6 +439,32 @@ export const resolveBundledCopilotCliPath = Effect.fn("resolveBundledCopilotCliP
   },
 );
 
+export const resolveAgencyCliPath = Effect.fn("resolveAgencyCliPath")(function* (input: {
+  readonly env?: Record<string, string | undefined>;
+  readonly platform: NodeJS.Platform;
+}): Effect.fn.Return<string | undefined> {
+  const resolved = yield* resolveCopilotCommandPath(AGENCY_CLI_COMMAND, {
+    env: input.env ?? process.env,
+    platform: input.platform,
+  }).pipe(Effect.catchTags({ CommandResolutionError: () => Effect.void }));
+  return resolved ? resolved : undefined;
+});
+
+/**
+ * The Agency CLI starts Copilot through its `copilot` subcommand and forwards
+ * every remaining argument to the underlying Copilot CLI.
+ */
+export function copilotCliArgsForCommandPath(
+  cliPath: string,
+  platform: NodeJS.Platform,
+): ReadonlyArray<string> {
+  const path = platform === "win32" ? NodePath.win32 : NodePath.posix;
+  const executable = path.basename(cliPath).toLowerCase();
+  const extension = path.extname(executable);
+  const executableName = extension.length > 0 ? executable.slice(0, -extension.length) : executable;
+  return executableName === AGENCY_CLI_COMMAND ? AGENCY_COPILOT_ARGS : [];
+}
+
 export const buildCopilotClientOptions = Effect.fn("buildCopilotClientOptions")(function* (input: {
   readonly settings: CopilotSettings;
   readonly cwd?: string;
@@ -482,17 +515,29 @@ export const buildCopilotClientOptions = Effect.fn("buildCopilotClientOptions")(
     env,
     platform: input.platform,
   });
-  const bundledCliPath = !configuredCliPath
-    ? yield* resolveBundledCopilotCliPath({
-        ...(input.cwd ? { cwd: input.cwd } : {}),
-        env,
-        platform: input.platform,
-      })
+  const agencyCliPath = !configuredCliPath
+    ? yield* resolveAgencyCliPath({ env, platform: input.platform })
     : undefined;
-  const cliPath = configuredCliPath ?? bundledCliPath;
+  const bundledCliPath =
+    !configuredCliPath && !agencyCliPath
+      ? yield* resolveBundledCopilotCliPath({
+          ...(input.cwd ? { cwd: input.cwd } : {}),
+          env,
+          platform: input.platform,
+        })
+      : undefined;
+  const cliPath = configuredCliPath ?? agencyCliPath ?? bundledCliPath;
+  const cliArgs = cliPath ? copilotCliArgsForCommandPath(cliPath, input.platform) : [];
 
   return {
-    ...(cliPath ? { connection: RuntimeConnection.forStdio({ path: cliPath }) } : {}),
+    ...(cliPath
+      ? {
+          connection: RuntimeConnection.forStdio({
+            path: cliPath,
+            ...(cliArgs.length > 0 ? { args: cliArgs } : {}),
+          }),
+        }
+      : {}),
     ...(input.cwd ? { workingDirectory: input.cwd } : {}),
     ...(input.baseDirectory ? { baseDirectory: input.baseDirectory } : {}),
     env,

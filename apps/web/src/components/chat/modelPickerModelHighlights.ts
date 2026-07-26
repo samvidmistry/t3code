@@ -5,6 +5,7 @@ import type { ProviderDriverKind } from "@t3tools/contracts";
  * Add entries as `provider:slug` when you want to highlight freshly shipped models.
  */
 const NEW_MODEL_KEYS = new Set<string>([
+  "claudeAgent:claude-opus-5",
   // Example: "claudeAgent:claude-opus-4-7",
 ]);
 

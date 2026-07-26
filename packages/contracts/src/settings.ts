@@ -234,9 +234,9 @@ export const CopilotSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Binary path",
         description:
-          "Optional path to a GitHub Copilot CLI binary. Leave blank to use the SDK-bundled CLI.",
+          "Optional path to an Agency or GitHub Copilot CLI binary. Leave blank to start Copilot with `agency copilot` when the Agency CLI is installed, otherwise the SDK-bundled CLI.",
         providerSettingsForm: {
-          placeholder: "Bundled Copilot CLI",
+          placeholder: "Agency or bundled Copilot CLI",
           clearWhenEmpty: "omit",
         },
       }),
