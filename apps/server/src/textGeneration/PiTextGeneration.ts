@@ -167,6 +167,7 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* 
         stagedSummary: input.stagedSummary,
         stagedPatch: input.stagedPatch,
         includeBranch: input.includeBranch === true,
+        policy: input.policy,
       });
       const generated = yield* runPiJson({
         operation: "generateCommitMessage",
@@ -192,6 +193,8 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* 
         commitSummary: input.commitSummary,
         diffSummary: input.diffSummary,
         diffPatch: input.diffPatch,
+        policy: input.policy,
+        changeRequestTemplate: input.changeRequestTemplate,
       });
       const generated = yield* runPiJson({
         operation: "generatePrContent",

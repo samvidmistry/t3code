@@ -465,6 +465,7 @@ export const makeCopilotTextGeneration = Effect.fn("makeCopilotTextGeneration")(
         stagedSummary: input.stagedSummary,
         stagedPatch: input.stagedPatch,
         includeBranch: input.includeBranch === true,
+        policy: input.policy,
       });
       const generated = yield* runCopilotJson({
         operation: "generateCommitMessage",
@@ -489,6 +490,8 @@ export const makeCopilotTextGeneration = Effect.fn("makeCopilotTextGeneration")(
         commitSummary: input.commitSummary,
         diffSummary: input.diffSummary,
         diffPatch: input.diffPatch,
+        policy: input.policy,
+        changeRequestTemplate: input.changeRequestTemplate,
       });
       const generated = yield* runCopilotJson({
         operation: "generatePrContent",
