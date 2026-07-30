@@ -390,6 +390,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
  * chevron) would leave the trigger unreadable.
  */
 export function buildTraitsTriggerDisplay(input: {
+  provider: ProviderDriverKind;
   descriptors: ReadonlyArray<ProviderOptionDescriptor>;
   primarySelectDescriptorId: string | null;
   ultrathinkPromptControlled: boolean;
@@ -401,6 +402,18 @@ export function buildTraitsTriggerDisplay(input: {
     if (descriptor.id === "fastMode" && descriptor.type === "boolean") {
       hasFastMode = true;
       continue;
+    }
+    if (
+      input.provider === "codex" &&
+      descriptor.id === "serviceTier" &&
+      descriptor.type === "select" &&
+      input.descriptors.some(({ id }) => id === "reasoningEffort")
+    ) {
+      const currentValue = getProviderOptionCurrentValue(descriptor);
+      const currentOption = descriptor.options.find((option) => option.id === currentValue);
+      if (currentOption?.id === "default" && currentOption.isDefault === true) {
+        continue;
+      }
     }
     const label =
       input.ultrathinkPromptControlled && descriptor.id === input.primarySelectDescriptorId
@@ -459,6 +472,7 @@ export const TraitsPicker = memo(function TraitsPicker({
   }
 
   const { label: triggerLabel, showFastModeIcon } = buildTraitsTriggerDisplay({
+    provider,
     descriptors,
     primarySelectDescriptorId: primarySelectDescriptor?.id ?? null,
     ultrathinkPromptControlled,

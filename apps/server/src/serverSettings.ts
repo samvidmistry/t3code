@@ -133,10 +133,9 @@ export class ServerSettingsService extends Context.Service<
     readonly streamChanges: Stream.Stream<ServerSettings>;
 
     /**
-     * Acquire the settings change subscription synchronously and return a
-     * stream backed by it. Consumers that fork a long-running watcher should
-     * use this instead of `streamChanges` so a publish cannot land between
-     * scheduling the watcher fiber and the fiber subscribing.
+     * Acquire a settings change subscription synchronously in the current
+     * fiber. Use this before reading a snapshot when changes between the
+     * snapshot and a lazily started stream must not be lost.
      */
     readonly subscribeChanges: Effect.Effect<Stream.Stream<ServerSettings>, never, Scope.Scope>;
   }
@@ -147,12 +146,16 @@ export class ServerSettingsService extends Context.Service<
 
 const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
   Effect.gen(function* () {
-    const { automaticGitFetchInterval, ...overridesForMerge } = overrides;
+    const { automaticGitFetchInterval, providerHealthRefreshInterval, ...overridesForMerge } =
+      overrides;
     const merged = deepMerge(DEFAULT_SERVER_SETTINGS, overridesForMerge);
     const initialSettings = yield* normalizeServerSettings({
       ...merged,
       ...(automaticGitFetchInterval !== undefined
         ? { automaticGitFetchInterval: automaticGitFetchInterval as Duration.Duration }
+        : {}),
+      ...(providerHealthRefreshInterval !== undefined
+        ? { providerHealthRefreshInterval: providerHealthRefreshInterval as Duration.Duration }
         : {}),
     });
     const currentSettingsRef = yield* Ref.make<ServerSettings>(initialSettings);
@@ -206,7 +209,9 @@ function fallbackTextGenerationProvider(settings: ServerSettings): ServerSetting
 
 // Values under these keys are compared as a whole — never stripped field-by-field.
 const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
+  "backgroundActivity",
   "automaticGitFetchInterval",
+  "providerHealthRefreshInterval",
   "sourceControlWriterModelSelection",
   "textGenerationModelSelection",
 ]);
@@ -252,11 +257,7 @@ const make = Effect.gen(function* () {
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const writeSemaphore = yield* Semaphore.make(1);
   const cacheKey = "settings" as const;
-  // Settings events are complete snapshots, so retaining only the latest
-  // value lets late subscribers catch up without replaying obsolete writes.
-  // In particular, this closes the gap between reading the initial settings
-  // and starting a change-stream consumer.
-  const changesPubSub = yield* PubSub.unbounded<ServerSettings>({ replay: 1 });
+  const changesPubSub = yield* PubSub.unbounded<ServerSettings>();
   const startedRef = yield* Ref.make(false);
   const startedDeferred = yield* Deferred.make<void, ServerSettingsError>();
   const watcherScope = yield* Scope.make("sequential");
@@ -356,6 +357,23 @@ const make = Effect.gen(function* () {
         providerInstances: providerInstances as ServerSettings["providerInstances"],
       };
     });
+
+  const materializeChanges = (changes: Stream.Stream<ServerSettings>) =>
+    changes.pipe(
+      Stream.mapEffect((settings) =>
+        materializeProviderEnvironmentSecrets(settings).pipe(
+          Effect.catch((error: ServerSettingsError) =>
+            Effect.logWarning("failed to materialize provider environment secrets", {
+              operation: error.operation,
+              providerInstanceId: error.providerInstanceId,
+              environmentVariable: error.environmentVariable,
+              cause: error.cause,
+            }).pipe(Effect.as(settings)),
+          ),
+        ),
+      ),
+      Stream.map(resolveTextGenerationProvider),
+    );
 
   const persistProviderEnvironmentSecrets = (
     current: ServerSettings,
@@ -550,23 +568,6 @@ const make = Effect.gen(function* () {
     yield* Deferred.succeed(startedDeferred, undefined).pipe(Effect.orDie);
   });
 
-  const resolveChangedSettings = (changes: Stream.Stream<ServerSettings>) =>
-    changes.pipe(
-      Stream.mapEffect((settings) =>
-        materializeProviderEnvironmentSecrets(settings).pipe(
-          Effect.catch((error: ServerSettingsError) =>
-            Effect.logWarning("failed to materialize provider environment secrets", {
-              operation: error.operation,
-              providerInstanceId: error.providerInstanceId,
-              environmentVariable: error.environmentVariable,
-              cause: error.cause,
-            }).pipe(Effect.as(settings)),
-          ),
-        ),
-      ),
-      Stream.map(resolveTextGenerationProvider),
-    );
-
   return {
     start,
     ready: Deferred.await(startedDeferred),
@@ -591,11 +592,11 @@ const make = Effect.gen(function* () {
         }),
       ),
     get streamChanges() {
-      return resolveChangedSettings(Stream.fromPubSub(changesPubSub));
+      return materializeChanges(Stream.fromPubSub(changesPubSub));
     },
     get subscribeChanges() {
       return PubSub.subscribe(changesPubSub).pipe(
-        Effect.map((subscription) => resolveChangedSettings(Stream.fromSubscription(subscription))),
+        Effect.map((subscription) => materializeChanges(Stream.fromSubscription(subscription))),
       );
     },
   } satisfies ServerSettingsService["Service"];

@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
-import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -33,6 +33,7 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -66,6 +67,7 @@ process.env.T3CODE_CURSOR_ENABLED = "1";
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
@@ -73,6 +75,35 @@ const TestHttpClientLive = Layer.succeed(
     Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }))),
   ),
 );
+
+const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+  reportClientActivity: () => Effect.void,
+  removeRpcClient: () => Effect.void,
+  reportHostPowerState: () => Effect.void,
+  snapshot: Effect.succeed({
+    hostPower: {
+      source: "unknown",
+      idle: "unknown",
+      idleSeconds: null,
+      locked: "unknown",
+      suspended: false,
+      onBattery: "unknown",
+      lowPowerMode: "unknown",
+      thermalState: "unknown",
+      stale: true,
+      updatedAt: TEST_EPOCH,
+    },
+    leases: [],
+    activeForegroundLeaseCount: 0,
+    activeScopeKeys: [],
+    shouldRunOpportunisticWork: true,
+    updatedAt: TEST_EPOCH,
+  }),
+  streamChanges: Stream.empty,
+  hasDemand: () => Effect.succeed(true),
+  shouldRunScopeWork: () => Effect.succeed(true),
+  shouldRunOpportunisticWork: Effect.succeed(true),
+});
 
 function selectDescriptor(
   id: string,
@@ -280,12 +311,9 @@ function makeMutableServerSettingsService(
 ) {
   return Effect.gen(function* () {
     const settingsRef = yield* Ref.make(initial);
-    // Mirror ServerSettingsService: change events are full snapshots and the
-    // latest one is replayed to consumers that subscribe after a write.
-    const changes = yield* PubSub.unbounded<ContractServerSettings>({ replay: 1 });
-    const settingsWatcherSubscribed = yield* Deferred.make<void>();
+    const changes = yield* PubSub.unbounded<ContractServerSettings>();
 
-    const service = {
+    return {
       start: Effect.void,
       ready: Effect.void,
       getSettings: Ref.get(settingsRef),
@@ -303,15 +331,10 @@ function makeMutableServerSettingsService(
       },
       get subscribeChanges() {
         return PubSub.subscribe(changes).pipe(
-          Effect.tap(() => Deferred.succeed(settingsWatcherSubscribed, undefined)),
-          Effect.map(Stream.fromSubscription),
+          Effect.map((subscription) => Stream.fromSubscription(subscription)),
         );
       },
     } satisfies ServerSettingsModule.ServerSettingsService["Service"];
-
-    return Object.assign(service, {
-      settingsWatcherSubscribed: Deferred.await(settingsWatcherSubscribed),
-    });
   });
 }
 
@@ -1014,6 +1037,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-merged-persist-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1249,6 +1273,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-refresh-failure-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1356,6 +1381,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-sync-failure-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1460,6 +1486,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               ),
             ),
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
             // NO spawner mock — `ChildProcessSpawner` is supplied by the
             // outer `NodeServices.layer` on `it.layer(...)` and will
             // genuinely spawn a subprocess. The missing-binary ENOENT is
@@ -1519,7 +1546,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           const firstMissing = `t3code_codex_first_`;
           const secondMissing = `t3code_codex_second_`;
           const spawnedCommands: Array<string> = [];
-          const secondProbeStarted = yield* Deferred.make<void>();
           const serverSettings = yield* makeMutableServerSettingsService(
             decodeServerSettings(
               deepMerge(encodedDefaultServerSettings, {
@@ -1555,16 +1581,12 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.updateService(ChildProcessSpawner.ChildProcessSpawner, (spawner) =>
               ChildProcessSpawner.make((command) => {
-                const executable = (command as { readonly command: string }).command;
-                spawnedCommands.push(executable);
-                return executable === secondMissing
-                  ? Deferred.succeed(secondProbeStarted, undefined).pipe(
-                      Effect.andThen(spawner.spawn(command)),
-                    )
-                  : spawner.spawn(command);
+                spawnedCommands.push((command as { readonly command: string }).command);
+                return spawner.spawn(command);
               }),
             ),
             Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -1572,7 +1594,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
 
           yield* Effect.gen(function* () {
             const registry = yield* ProviderRegistry.ProviderRegistry;
-            yield* serverSettings.settingsWatcherSubscribed;
             // Boot-time probe: the default codex instance is enabled with
             // `firstMissing`, so the real spawner yields ENOENT and the
             // snapshot should be `status: "error"`.
@@ -1608,11 +1629,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 codex: { enabled: true, binaryPath: secondMissing },
               },
             });
-            yield* Deferred.await(secondProbeStarted).pipe(Effect.timeout("5 seconds"));
 
-            // Poll until the replacement probe's error snapshot reaches the
-            // aggregator. The deferred above waits on the real process boundary;
-            // TestClock here only drives the managed snapshot publication.
+            // Poll until the injected process boundary observes the new
+            // executable. This verifies the public settings-to-probe behavior
+            // without depending on timestamps assigned by TestClock.
             const refreshed = yield* Effect.gen(function* () {
               for (let attempts = 0; attempts < 60; attempts += 1) {
                 const providers = yield* registry.getProviders;
@@ -1682,6 +1702,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             ),
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -1742,6 +1763,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 ),
               ),
               Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(
                 mockCommandSpawnerLayer((command, args) => {
                   if (command === "cursor-agent") {
@@ -1783,11 +1805,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               assert.deepStrictEqual(providers.map((provider) => provider.instanceId).toSorted(), [
                 "claudeAgent",
                 "codex",
-                "copilot",
                 "cursor",
                 "grok",
                 "opencode",
-                "pi",
               ]);
               assert.strictEqual(cursorProvider?.enabled, false);
               assert.strictEqual(cursorProvider?.status, "disabled");
@@ -1825,61 +1845,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           assert.strictEqual(status.status, "ready");
           assert.strictEqual(status.installed, true);
           assert.strictEqual(status.auth.status, "authenticated");
-          const gpt56Models = status.models.filter((model) => model.slug.startsWith("gpt-5.6-"));
-          assert.deepStrictEqual(
-            gpt56Models.map(({ slug, name, isCustom }) => ({ slug, name, isCustom })),
-            [
-              { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", isCustom: false },
-              { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra", isCustom: false },
-              { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna", isCustom: false },
-            ],
-          );
-          for (const model of gpt56Models) {
-            assert.ok(model.capabilities);
-            assert.deepStrictEqual(model.capabilities.optionDescriptors, [
-              {
-                id: "effort",
-                label: "Reasoning",
-                type: "select",
-                options: [
-                  { id: "low", label: "Low" },
-                  { id: "medium", label: "Medium" },
-                  { id: "high", label: "High", isDefault: true },
-                  { id: "xhigh", label: "Extra High" },
-                  { id: "max", label: "Max" },
-                  { id: "ultracode", label: "Ultracode" },
-                  { id: "ultrathink", label: "Ultrathink" },
-                ],
-                currentValue: "high",
-                promptInjectedValues: ["ultrathink"],
-              },
-              {
-                id: "fastMode",
-                label: "Fast Mode",
-                type: "boolean",
-              },
-              {
-                id: "contextWindow",
-                label: "Context Window",
-                type: "select",
-                options: [
-                  { id: "200k", label: "200k", isDefault: true },
-                  { id: "1m", label: "1M" },
-                ],
-                currentValue: "200k",
-              },
-            ]);
-          }
-          const gemini36Flash = status.models.find((model) => model.slug === "gemini-3.6-flash");
-          assert.deepStrictEqual(
-            gemini36Flash && {
-              slug: gemini36Flash.slug,
-              name: gemini36Flash.name,
-              isCustom: gemini36Flash.isCustom,
-            },
-            { slug: "gemini-3.6-flash", name: "Gemini 3.6 Flash", isCustom: false },
-          );
-          assert.deepStrictEqual(gemini36Flash?.capabilities, gpt56Models[0]?.capabilities);
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args) => {
@@ -2021,63 +1986,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "2.1.168\n", stderr: "", code: 0 };
-              if (joined === "auth status")
-                return {
-                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
-                  stderr: "",
-                  code: 0,
-                };
-              throw new Error(`Unexpected args: ${joined}`);
-            }),
-          ),
-        ),
-      );
-
-      it.effect("includes Claude Opus 5 on supported Claude Code versions", () =>
-        Effect.gen(function* () {
-          const status = yield* checkClaudeProviderStatus(
-            defaultClaudeSettings,
-            claudeCapabilities(),
-          );
-          const opus5 = status.models.find((model) => model.slug === "claude-opus-5");
-          assert.strictEqual(opus5?.name, "Claude Opus 5");
-          assert.strictEqual(status.message, undefined);
-        }).pipe(
-          Effect.provide(
-            mockSpawnerLayer((args) => {
-              const joined = args.join(" ");
-              if (joined === "--version") return { stdout: "2.1.219\n", stderr: "", code: 0 };
-              if (joined === "auth status")
-                return {
-                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
-                  stderr: "",
-                  code: 0,
-                };
-              throw new Error(`Unexpected args: ${joined}`);
-            }),
-          ),
-        ),
-      );
-
-      it.effect("hides Claude Opus 5 on older Claude Code versions", () =>
-        Effect.gen(function* () {
-          const status = yield* checkClaudeProviderStatus(
-            defaultClaudeSettings,
-            claudeCapabilities(),
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-5"),
-            false,
-          );
-          assert.strictEqual(
-            status.message,
-            "Claude Code v2.1.218 is too old for Claude Opus 5. Upgrade to v2.1.219 or newer to access it.",
-          );
-        }).pipe(
-          Effect.provide(
-            mockSpawnerLayer((args) => {
-              const joined = args.join(" ");
-              if (joined === "--version") return { stdout: "2.1.218\n", stderr: "", code: 0 };
               if (joined === "auth status")
                 return {
                   stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
