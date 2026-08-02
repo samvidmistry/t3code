@@ -68,6 +68,8 @@ export interface BranchNameGenerationResult {
 export interface ThreadTitleGenerationInput {
   cwd: string;
   message: string;
+  /** Present when replacing an existing title from the current thread history. */
+  previousTitle?: string | undefined;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
@@ -113,9 +115,7 @@ export class TextGeneration extends Context.Service<
       input: BranchNameGenerationInput,
     ) => Effect.Effect<BranchNameGenerationResult, TextGenerationError>;
 
-    /**
-     * Generate a concise thread title from a user's first message.
-     */
+    /** Generate a concise thread title from a first message or thread history. */
     readonly generateThreadTitle: (
       input: ThreadTitleGenerationInput,
     ) => Effect.Effect<ThreadTitleGenerationResult, TextGenerationError>;
