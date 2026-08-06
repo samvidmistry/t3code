@@ -179,6 +179,77 @@ describe("buildThreadFeed", () => {
     );
   });
 
+  it("shows correlated running tools and replaces them when they complete", () => {
+    const turnId = TurnId.make("turn-running-tool");
+    const base = makeThread({
+      id: ThreadId.make("thread-running-tool"),
+      projectId: ProjectId.make("project-1"),
+      title: "Running tool",
+      latestTurn: {
+        turnId,
+        state: "running",
+        requestedAt: "2026-04-01T00:00:00.000Z",
+        startedAt: "2026-04-01T00:00:01.000Z",
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      activities: [
+        makeActivity({
+          id: EventId.make("tool-started"),
+          kind: "tool.started",
+          tone: "tool",
+          summary: "Bash started",
+          createdAt: "2026-04-01T00:00:01.000Z",
+          turnId,
+          payload: {
+            title: "Bash",
+            itemType: "command_execution",
+            status: "inProgress",
+            data: { toolCallId: "call-1", item: { command: "sleep 30" } },
+          },
+        }),
+      ],
+    });
+
+    const running = buildThreadFeed(base)[0];
+    expect(running).toMatchObject({
+      type: "activity-group",
+      activities: [
+        {
+          id: "tool-started",
+          summary: "Bash",
+          detail: "sleep 30",
+          status: "neutral",
+        },
+      ],
+    });
+
+    const completed = buildThreadFeed({
+      ...base,
+      activities: [
+        ...base.activities,
+        makeActivity({
+          id: EventId.make("tool-completed"),
+          kind: "tool.completed",
+          tone: "tool",
+          summary: "Bash",
+          createdAt: "2026-04-01T00:00:02.000Z",
+          turnId,
+          payload: {
+            title: "Bash",
+            itemType: "command_execution",
+            status: "completed",
+            data: { toolCallId: "call-1", item: { command: "sleep 30" } },
+          },
+        }),
+      ],
+    })[0];
+    expect(completed).toMatchObject({
+      type: "activity-group",
+      activities: [{ id: "tool-completed", status: "success" }],
+    });
+  });
+
   it("keeps MCP inputs available to expanded mobile work rows", () => {
     const turnId = TurnId.make("turn-mcp");
     const thread = makeThread({
@@ -530,5 +601,41 @@ describe("buildThreadFeed", () => {
       type: "work-toggle",
       expanded: true,
     });
+  });
+});
+
+describe("quiet timeline: nested agents", () => {
+  it("keeps a nested agent's terminal row but hides its background work", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-nested"),
+      projectId: ProjectId.make("project-1"),
+      title: "Nested agents",
+      activities: [
+        // A subagent's own shell: internal, covered by the owner's liveness.
+        makeActivity({
+          id: EventId.make("shell-done"),
+          kind: "task.completed",
+          summary: "Task completed",
+          createdAt: "2026-04-01T00:00:02.000Z",
+          payload: { taskId: "sh-1", agentId: "owner", agentKind: "background" },
+        }),
+        // A nested AGENT's completion: mobile has no Agents sheet, so this
+        // terminal row is the only signal it ever finished.
+        makeActivity({
+          id: EventId.make("nested-done"),
+          kind: "task.completed",
+          summary: "Task completed",
+          createdAt: "2026-04-01T00:00:03.000Z",
+          payload: { taskId: "n-1", agentId: "owner", agentKind: "agent" },
+        }),
+      ],
+    });
+
+    const feed = buildThreadFeed(thread);
+    const ids = feed.flatMap((entry) =>
+      entry.type === "activity-group" ? entry.activities.map((row) => row.id) : [],
+    );
+    expect(ids).toContain("nested-done");
+    expect(ids).not.toContain("shell-done");
   });
 });

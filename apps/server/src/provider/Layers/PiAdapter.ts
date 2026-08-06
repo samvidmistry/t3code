@@ -18,6 +18,7 @@ import {
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
+  type RuntimeTaskUsage,
   ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
@@ -55,6 +56,7 @@ import {
   subagentChildTaskId,
   subagentChildTerminalStatus,
   type NormalizedSubagentSnapshot,
+  type NormalizedSubagentUsage,
 } from "./PiSubagentSnapshot.ts";
 import {
   type AgentSessionEvent,
@@ -134,6 +136,9 @@ interface PiToolItem {
 // Per child subagent task tracked against its parent `subagent` tool call.
 interface SubagentChildTaskState {
   readonly taskId: RuntimeTaskId;
+  readonly title: string;
+  readonly role: string;
+  readonly toolUseId: string;
   started: boolean;
   completed: boolean;
   // compact fingerprint of the last emitted snapshot (no transcript retained)
@@ -279,6 +284,26 @@ export function normalizePiTokenUsage(
 // Extract human-readable text from a tool `partialResult`, which may be a raw
 // string or a structured `AgentToolResult` ({ content: [{ type: "text", text }] }).
 // Falls back to compact JSON so structured payloads never render as "[object Object]".
+function normalizePiSubagentUsage(
+  usage: NormalizedSubagentUsage | undefined,
+): RuntimeTaskUsage | undefined {
+  if (!usage) return undefined;
+  const inputTokens = finiteNonNegativeInteger(usage.input);
+  const outputTokens = finiteNonNegativeInteger(usage.output);
+  const cacheReadTokens = finiteNonNegativeInteger(usage.cacheRead);
+  const cacheWriteTokens = finiteNonNegativeInteger(usage.cacheWrite);
+  const cachedInputTokens = (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+  const totalTokens =
+    (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+  if (totalTokens <= 0) return undefined;
+  return {
+    totalTokens,
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+  };
+}
+
 export function extractPiPartialResultText(partial: unknown): string | undefined {
   if (partial === undefined || partial === null) return undefined;
   if (typeof partial === "string") return partial;
@@ -489,6 +514,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         if (!state) {
           state = {
             taskId: RuntimeTaskId.make(subagentChildTaskId(toolCallId, child)),
+            title: child.task.trim() || child.agent,
+            role: child.agent,
+            toolUseId: toolCallId,
             started: false,
             completed: false,
             progressFingerprint: undefined,
@@ -503,7 +531,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           if (!final && !subagentChildHasActivity(child)) continue;
           state.started = true;
           const stamp = yield* makeEventStamp();
-          const description = child.task.trim();
           yield* offerRuntimeEvent({
             ...stamp,
             provider: PROVIDER,
@@ -513,8 +540,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.started",
             payload: {
               taskId: state.taskId,
-              ...(description.length > 0 ? { description } : {}),
-              ...(child.agent.length > 0 ? { taskType: child.agent } : {}),
+              description: state.title,
+              taskType: "subagent",
+              title: state.title,
+              role: state.role,
+              toolUseId: state.toolUseId,
             },
           });
         }
@@ -523,6 +553,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           if (state.completed) continue;
           state.completed = true;
           const summary = subagentChildCompletionSummary(child);
+          const typedUsage = normalizePiSubagentUsage(child.usage);
           const stamp = yield* makeEventStamp();
           yield* offerRuntimeEvent({
             ...stamp,
@@ -536,6 +567,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               status: subagentChildTerminalStatus(child),
               ...(summary ? { summary } : {}),
               ...(child.usage ? { usage: child.usage } : {}),
+              ...(typedUsage ? { typedUsage } : {}),
+              taskType: "subagent",
+              title: state.title,
+              role: state.role,
+              toolUseId: state.toolUseId,
             },
           });
           continue;
@@ -544,8 +580,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         const fingerprint = subagentChildFingerprint(child);
         if (fingerprint === state.progressFingerprint) continue;
         state.progressFingerprint = fingerprint;
-        const description = subagentChildProgressDescription(child);
-        if (!description) continue;
+        const summary = subagentChildProgressDescription(child);
+        if (!summary) continue;
+        const typedUsage = normalizePiSubagentUsage(child.usage);
         const stamp = yield* makeEventStamp();
         yield* offerRuntimeEvent({
           ...stamp,
@@ -556,9 +593,15 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           type: "task.progress",
           payload: {
             taskId: state.taskId,
-            description,
+            description: state.title,
+            summary,
             ...(child.lastToolName ? { lastToolName: child.lastToolName } : {}),
             ...(child.usage ? { usage: child.usage } : {}),
+            ...(typedUsage ? { typedUsage } : {}),
+            taskType: "subagent",
+            title: state.title,
+            role: state.role,
+            toolUseId: state.toolUseId,
           },
         });
       }
@@ -585,7 +628,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             threadId: context.session.threadId,
             ...(context.turnState ? { turnId: context.turnState.turnId } : {}),
             type: "task.completed",
-            payload: { taskId: state.taskId, status },
+            payload: {
+              taskId: state.taskId,
+              status,
+              taskType: "subagent",
+              title: state.title,
+              role: state.role,
+              toolUseId: state.toolUseId,
+            },
           });
         }
       }

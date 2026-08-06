@@ -36,7 +36,7 @@ type TextGenOperation =
   | "generateBranchName"
   | "generateThreadTitle";
 
-const encodeJsonString = Schema.encodeEffect(Schema.UnknownFromJsonString);
+const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const isTextGenerationError = Schema.is(TextGenerationError);
 
 export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* (

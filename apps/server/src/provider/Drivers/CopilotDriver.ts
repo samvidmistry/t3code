@@ -22,7 +22,9 @@ import * as Stream from "effect/Stream";
 import * as FileSystem from "effect/FileSystem";
 
 import { makeCopilotTextGeneration } from "../../textGeneration/CopilotTextGeneration.ts";
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCopilotAdapter } from "../Layers/CopilotAdapter.ts";
 import {
@@ -45,11 +47,13 @@ const SNAPSHOT_REFRESH_INTERVAL = Duration.hours(1);
 const decodeCopilotSettings = Schema.decodeSync(CopilotSettings);
 
 export type CopilotDriverEnv =
+  | BackgroundPolicy.BackgroundPolicy
   | FileSystem.FileSystem
   | Path.Path
   | Context.Service.Identifier<typeof HostProcessPlatform>
   | ProviderEventLoggers
-  | ServerConfig;
+  | ServerConfig
+  | ServerSettingsService;
 
 const withInstanceIdentity =
   (input: {

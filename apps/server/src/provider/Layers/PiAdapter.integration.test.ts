@@ -227,17 +227,18 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
           Effect.flatMap(() => Ref.get(collected.store)),
         );
         const progress = events.filter((e) => e.type === "task.progress");
-        const descriptions = progress.flatMap((e) =>
-          e.type === "task.progress" ? [e.payload.description] : [],
+        const summaries = progress.flatMap((e) =>
+          e.type === "task.progress" && e.payload.summary ? [e.payload.summary] : [],
         );
-        expect(descriptions).toEqual(["aaaa", "bbbb", "Using read", "Ran read", "Ran read"]);
+        expect(summaries).toEqual(["aaaa", "bbbb", "Using read", "Ran read", "Ran read"]);
+        expect(progress.every((event) => event.payload.description === "do the thing")).toBe(true);
         // Pi's raw subagent snapshots contain cumulative child transcripts, so
         // canonical task events must remain compact and transcript-free.
         const taskEvents = events.filter((event) => event.type.startsWith("task."));
         expect(taskEvents.some((event) => "raw" in event)).toBe(false);
         // the tool-call progress carries the resolved lastToolName
         const usingRead = progress.find(
-          (e) => e.type === "task.progress" && e.payload.description === "Using read",
+          (e) => e.type === "task.progress" && e.payload.summary === "Using read",
         );
         if (usingRead?.type === "task.progress") {
           expect(usingRead.payload.lastToolName).toBe("read");
@@ -923,7 +924,12 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       expect(completed).toHaveLength(1);
       if (started[0]?.type === "task.started") {
         expect(started[0].payload.taskId).toBe("pi-subagent:sa-1:0");
-        expect(started[0].payload.taskType).toBe("worker");
+        expect(started[0].payload).toMatchObject({
+          taskType: "subagent",
+          title: "do the thing",
+          role: "worker",
+          toolUseId: "sa-1",
+        });
       }
       if (completed[0]?.type === "task.completed") {
         expect(completed[0].payload.status).toBe("completed");

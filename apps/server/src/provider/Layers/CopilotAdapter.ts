@@ -26,6 +26,7 @@ import {
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
+  type RuntimeTaskUsage,
   type ThreadTokenUsageSnapshot,
   ThreadId,
   TurnId,
@@ -101,6 +102,15 @@ type CopilotTaskStatus = CopilotTaskInfo["status"];
 interface CopilotTaskState {
   description: string;
   status: CopilotTaskStatus;
+}
+
+interface CopilotSubagentState {
+  readonly taskId: RuntimeTaskId;
+  readonly title: string;
+  readonly role: string;
+  readonly toolUseId: string;
+  readonly model?: string | undefined;
+  latestSummary?: string | undefined;
 }
 
 export interface CopilotAdapterLiveOptions {
@@ -216,6 +226,8 @@ interface CopilotSessionContext {
   readonly pendingTaskCompletionTextByTurnId: Map<TurnId, string>;
   readonly emittedTurnDiffByTurnId: Map<TurnId, string>;
   readonly copilotTasks: Map<string, CopilotTaskState>;
+  readonly copilotSubagentsByToolCallId: Map<string, CopilotSubagentState>;
+  readonly copilotSubagentsByTaskId: Map<string, CopilotSubagentState>;
   readonly turnIdsWithAssistantText: Set<TurnId>;
   readonly turnIdsWithRootAssistantTextSinceToolStart: Set<TurnId>;
   readonly turnIdsWithSuccessfulToolCompletion: Set<TurnId>;
@@ -777,6 +789,52 @@ function copilotTaskCompletionSummary(task: CopilotTaskInfo): string | undefined
     return task.description;
   }
   return task.error ?? task.result ?? task.latestResponse ?? task.description;
+}
+
+function copilotSubagentStateForAgentId(
+  context: CopilotSessionContext,
+  agentId: string | undefined,
+): CopilotSubagentState | undefined {
+  return agentId ? context.copilotSubagentsByTaskId.get(agentId) : undefined;
+}
+
+function copilotOwningSubagent(
+  context: CopilotSessionContext,
+  agentId: string | undefined,
+  parentToolCallId: string | undefined,
+): CopilotSubagentState | undefined {
+  return (
+    copilotSubagentStateForAgentId(context, agentId) ??
+    (parentToolCallId ? context.copilotSubagentsByToolCallId.get(parentToolCallId) : undefined)
+  );
+}
+
+function copilotSubagentLinkage(state: CopilotSubagentState) {
+  return {
+    taskType: "subagent" as const,
+    title: state.title,
+    role: state.role,
+    toolUseId: state.toolUseId,
+    ...(state.model ? { model: state.model } : {}),
+  };
+}
+
+function copilotSubagentUsage(input: {
+  readonly totalTokens?: number | undefined;
+  readonly totalToolCalls?: number | undefined;
+  readonly durationMs?: number | undefined;
+}): RuntimeTaskUsage | undefined {
+  const count = (value: number | undefined): number | undefined =>
+    value !== undefined && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
+  const totalTokens = count(input.totalTokens);
+  if (totalTokens === undefined) return undefined;
+  const toolUses = count(input.totalToolCalls);
+  const durationMs = count(input.durationMs);
+  return {
+    totalTokens,
+    ...(toolUses !== undefined ? { toolUses } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+  };
 }
 
 function isStringRecord(value: unknown): value is Record<string, unknown> {
@@ -2021,14 +2079,30 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       }
       const taskList = yield* copilotSdk.readBackgroundTasks(context);
       for (const task of taskList.tasks) {
-        const taskId = copilotTaskId(task);
+        const nativeSubagent =
+          task.type === "agent"
+            ? context.copilotSubagentsByToolCallId.get(task.toolCallId)
+            : undefined;
+        const taskId = nativeSubagent?.taskId ?? copilotTaskId(task);
         if (!taskId) {
           continue;
         }
-        const description = copilotTaskDescription(task);
-        const taskType = copilotTaskType(task);
+        const description = nativeSubagent?.title ?? copilotTaskDescription(task);
+        const taskType = task.type === "agent" ? "subagent" : copilotTaskType(task);
         const previous = context.copilotTasks.get(taskId);
         const runtimeTaskId = RuntimeTaskId.make(taskId);
+        const linkage = nativeSubagent
+          ? copilotSubagentLinkage(nativeSubagent)
+          : task.type === "agent"
+            ? {
+                taskType: "subagent" as const,
+                title: description,
+                ...(task.agentType ? { role: task.agentType } : {}),
+                ...(task.toolCallId ? { toolUseId: task.toolCallId } : {}),
+              }
+            : taskType
+              ? { taskType }
+              : {};
         if (!previous) {
           yield* emit({
             ...createBaseEvent({
@@ -2040,7 +2114,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
             payload: {
               taskId: runtimeTaskId,
               description,
-              ...(taskType ? { taskType } : {}),
+              ...linkage,
             },
           });
         }
@@ -2059,6 +2133,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
               taskId: runtimeTaskId,
               description,
               summary: copilotTaskProgressSummary(task.status),
+              status: task.status,
+              ...linkage,
             },
           });
         }
@@ -2076,6 +2152,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
               taskId: runtimeTaskId,
               status: completedStatus,
               ...(summary ? { summary } : {}),
+              ...linkage,
             },
           });
         }
@@ -2520,6 +2597,9 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         return;
       }
       case "assistant.reasoning": {
+        if (event.agentId !== undefined) {
+          return;
+        }
         const turnId = resolveTurnIdForEvent(context, {
           sdkTurnId: context.activeSdkTurnId,
           sdkEventTimestamp: event.timestamp,
@@ -2538,6 +2618,9 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         return;
       }
       case "assistant.message_delta": {
+        if (event.agentId !== undefined) {
+          return;
+        }
         const turnId = resolveTurnIdForEvent(context, {
           sdkTurnId: context.activeSdkTurnId,
           sdkEventTimestamp: event.timestamp,
@@ -2569,6 +2652,28 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           parentProviderItemId: event.data.parentToolCallId,
         });
         if (!turnId) {
+          return;
+        }
+        if (event.agentId !== undefined) {
+          const state = copilotSubagentStateForAgentId(context, event.agentId);
+          const summary = trimOrUndefined(event.data.content);
+          if (state && summary) {
+            state.latestSummary = summary;
+            await emitAsync({
+              ...createBaseEvent({
+                threadId: context.threadId,
+                turnId,
+                raw: event,
+              }),
+              type: "task.progress",
+              payload: {
+                taskId: state.taskId,
+                description: state.title,
+                summary,
+                ...copilotSubagentLinkage(state),
+              },
+            });
+          }
           return;
         }
         const itemId = `copilot-message-${event.data.messageId}`;
@@ -2675,6 +2780,11 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           ...toolMeta,
         });
         context.turnIdByProviderItemId.set(event.data.toolCallId, turnId);
+        const owningSubagent = copilotOwningSubagent(
+          context,
+          event.agentId,
+          event.data.parentToolCallId,
+        );
         if (isTaskCompleteTool(event.data.toolName)) {
           return;
         }
@@ -2699,6 +2809,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
               toolMeta,
               ...(event.data.arguments ? { arguments: event.data.arguments } : {}),
             }),
+            ...(owningSubagent ? { agentId: owningSubagent.taskId } : {}),
+            ...(event.data.parentToolCallId
+              ? { parentToolUseId: event.data.parentToolCallId }
+              : {}),
           },
         });
         return;
@@ -2716,6 +2830,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           return;
         }
         const toolMeta = context.toolMetaById.get(event.data.toolCallId);
+        const owningSubagent = copilotOwningSubagent(context, event.agentId, undefined);
         await emitAsync({
           ...createBaseEvent({
             threadId: context.threadId,
@@ -2728,6 +2843,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
             toolUseId: event.data.toolCallId,
             ...(toolMeta ? { toolName: toolMeta.toolName } : {}),
             summary,
+            ...(owningSubagent ? { taskId: owningSubagent.taskId } : {}),
           },
         });
         return;
@@ -2755,6 +2871,11 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
             }
           : undefined;
         const toolMeta = context.toolMetaById.get(event.data.toolCallId) ?? fallbackToolMeta;
+        const owningSubagent = copilotOwningSubagent(
+          context,
+          event.agentId,
+          event.data.parentToolCallId,
+        );
         const rawDetail =
           trimOrUndefined(event.data.result?.detailedContent) ??
           trimOrUndefined(event.data.result?.content) ??
@@ -2793,6 +2914,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
               ...(event.data.error ? { error: event.data.error } : {}),
               ...(event.data.toolTelemetry ? { toolTelemetry: event.data.toolTelemetry } : {}),
             }),
+            ...(owningSubagent ? { agentId: owningSubagent.taskId } : {}),
+            ...(event.data.parentToolCallId
+              ? { parentToolUseId: event.data.parentToolCallId }
+              : {}),
           },
         });
         const diffText = event.data.success
@@ -2818,10 +2943,79 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         return;
       }
       case "subagent.started": {
-        const turnId = context.turnIdByProviderItemId.get(event.data.toolCallId);
-        if (turnId) {
-          markTurnContinuingWithTool(context, turnId);
+        const turnId =
+          context.turnIdByProviderItemId.get(event.data.toolCallId) ?? context.activeTurnId;
+        if (!turnId) {
+          return;
         }
+        markTurnContinuingWithTool(context, turnId);
+        const state: CopilotSubagentState = {
+          taskId: RuntimeTaskId.make(event.agentId ?? `copilot-subagent:${event.data.toolCallId}`),
+          title: event.data.agentDescription || event.data.agentDisplayName,
+          role: event.data.agentName,
+          toolUseId: event.data.toolCallId,
+          ...(event.data.model ? { model: event.data.model } : {}),
+        };
+        context.copilotSubagentsByToolCallId.set(event.data.toolCallId, state);
+        context.copilotSubagentsByTaskId.set(state.taskId, state);
+        context.copilotTasks.set(state.taskId, {
+          description: state.title,
+          status: "running",
+        });
+        await emitAsync({
+          ...createBaseEvent({
+            threadId: context.threadId,
+            turnId,
+            raw: event,
+          }),
+          type: "task.started",
+          payload: {
+            taskId: state.taskId,
+            description: state.title,
+            ...copilotSubagentLinkage(state),
+          },
+        });
+        return;
+      }
+      case "subagent.completed":
+      case "subagent.failed": {
+        const turnId =
+          context.turnIdByProviderItemId.get(event.data.toolCallId) ?? context.activeTurnId;
+        if (!turnId) {
+          return;
+        }
+        const existing = context.copilotSubagentsByToolCallId.get(event.data.toolCallId);
+        const state: CopilotSubagentState = existing ?? {
+          taskId: RuntimeTaskId.make(event.agentId ?? `copilot-subagent:${event.data.toolCallId}`),
+          title: event.data.agentDisplayName,
+          role: event.data.agentName,
+          toolUseId: event.data.toolCallId,
+          ...(event.data.model ? { model: event.data.model } : {}),
+        };
+        context.copilotSubagentsByToolCallId.set(event.data.toolCallId, state);
+        context.copilotSubagentsByTaskId.set(state.taskId, state);
+        const failed = event.type === "subagent.failed";
+        const summary = failed ? event.data.error : state.latestSummary;
+        const typedUsage = copilotSubagentUsage(event.data);
+        context.copilotTasks.set(state.taskId, {
+          description: state.title,
+          status: failed ? "failed" : "completed",
+        });
+        await emitAsync({
+          ...createBaseEvent({
+            threadId: context.threadId,
+            turnId,
+            raw: event,
+          }),
+          type: "task.completed",
+          payload: {
+            taskId: state.taskId,
+            status: failed ? "failed" : "completed",
+            ...(summary ? { summary } : {}),
+            ...(typedUsage ? { typedUsage } : {}),
+            ...copilotSubagentLinkage(state),
+          },
+        });
         return;
       }
       case "mcp.oauth_required": {
@@ -3226,6 +3420,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         pendingTaskCompletionTextByTurnId: new Map(),
         emittedTurnDiffByTurnId: new Map(),
         copilotTasks: new Map(),
+        copilotSubagentsByToolCallId: new Map(),
+        copilotSubagentsByTaskId: new Map(),
         turnIdsWithAssistantText: new Set(),
         turnIdsWithRootAssistantTextSinceToolStart: new Set(),
         turnIdsWithSuccessfulToolCompletion: new Set(),

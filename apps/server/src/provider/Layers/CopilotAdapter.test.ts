@@ -39,7 +39,7 @@ import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { makeCopilotAdapter } from "./CopilotAdapter.ts";
 
 const decodeCopilotSettings = Schema.decodeSync(CopilotSettings);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 class CopilotAdapter extends Context.Service<CopilotAdapter, CopilotAdapterShape>()(
   "t3/provider/Layers/CopilotAdapter.test/CopilotAdapter",
@@ -3554,6 +3554,206 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
       if (resolved?.type === "user-input.resolved") {
         NodeAssert.deepStrictEqual(resolved.payload.answers, { answer: "" });
       }
+    }),
+  );
+
+  it.effect("maps native Copilot subagent and nested tool streams to agent activities", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-native-subagent-stream");
+
+      yield* adapter.startSession({
+        provider: COPILOT_DRIVER,
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "delegate this investigation",
+        attachments: [],
+      });
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) => Effect.sync(() => runtimeEvents.push(event))),
+        Effect.forkChild,
+      );
+      yield* waitForSdkEventQueue();
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      NodeAssert.ok(config?.onEvent);
+      const emit = (event: SessionEvent) => config.onEvent?.(event);
+      const timestamp = yield* nowIso;
+      emit({
+        id: "evt-copilot-subagent-turn-start",
+        timestamp,
+        parentId: null,
+        type: "assistant.turn_start",
+        data: { turnId: "sdk-turn-subagent" },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-tool-start",
+        timestamp,
+        parentId: null,
+        type: "tool.execution_start",
+        data: {
+          toolCallId: "task-call-1",
+          toolName: "Task",
+          arguments: { prompt: "Inspect streaming" },
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-start",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "subagent.started",
+        data: {
+          toolCallId: "task-call-1",
+          agentName: "explore",
+          agentDisplayName: "Explore",
+          agentDescription: "Inspect streaming",
+          model: "gpt-5.4",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-message",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "assistant.message",
+        data: {
+          messageId: "agent-message-1",
+          content: "Found the streaming path",
+          parentToolCallId: "task-call-1",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-nested-tool-start",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "tool.execution_start",
+        data: {
+          toolCallId: "nested-read-1",
+          parentToolCallId: "task-call-1",
+          toolName: "Read",
+          arguments: { path: "src/index.ts" },
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-nested-tool-progress",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "tool.execution_progress",
+        data: {
+          toolCallId: "nested-read-1",
+          progressMessage: "Reading src/index.ts",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-nested-tool-complete",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "nested-read-1",
+          parentToolCallId: "task-call-1",
+          success: true,
+          result: { content: "done" },
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-subagent-complete",
+        timestamp,
+        parentId: null,
+        agentId: "agent-1",
+        type: "subagent.completed",
+        data: {
+          toolCallId: "task-call-1",
+          agentName: "explore",
+          agentDisplayName: "Explore",
+          model: "gpt-5.4",
+          totalTokens: 321,
+          totalToolCalls: 1,
+          durationMs: 500,
+        },
+      } as SessionEvent);
+
+      for (
+        let attempt = 0;
+        attempt < 20 &&
+        !runtimeEvents.some(
+          (event) => event.type === "task.completed" && event.payload.taskId === "agent-1",
+        );
+        attempt += 1
+      ) {
+        yield* waitForSdkEventQueue();
+      }
+      yield* Fiber.interrupt(runtimeEventsFiber).pipe(Effect.ignore);
+
+      const taskStarted = runtimeEvents.find(
+        (event) => event.type === "task.started" && event.payload.taskId === "agent-1",
+      );
+      NodeAssert.equal(taskStarted?.type, "task.started");
+      if (taskStarted?.type === "task.started") {
+        NodeAssert.deepStrictEqual(taskStarted.payload, {
+          taskId: "agent-1",
+          description: "Inspect streaming",
+          taskType: "subagent",
+          title: "Inspect streaming",
+          role: "explore",
+          toolUseId: "task-call-1",
+          model: "gpt-5.4",
+        });
+      }
+      const taskProgress = runtimeEvents.find(
+        (event) => event.type === "task.progress" && event.payload.taskId === "agent-1",
+      );
+      NodeAssert.equal(taskProgress?.type, "task.progress");
+      if (taskProgress?.type === "task.progress") {
+        NodeAssert.equal(taskProgress.payload.summary, "Found the streaming path");
+      }
+      const toolProgress = runtimeEvents.find((event) => event.type === "tool.progress");
+      NodeAssert.equal(toolProgress?.type, "tool.progress");
+      if (toolProgress?.type === "tool.progress") {
+        NodeAssert.equal(toolProgress.payload.taskId, "agent-1");
+      }
+      for (const type of ["item.started", "item.completed"] as const) {
+        const toolEvent = runtimeEvents.find(
+          (event) => event.type === type && String(event.itemId) === "copilot-tool-nested-read-1",
+        );
+        NodeAssert.equal(toolEvent?.type, type);
+        if (toolEvent?.type === type) {
+          NodeAssert.equal(toolEvent.payload.agentId, "agent-1");
+          NodeAssert.equal(toolEvent.payload.parentToolUseId, "task-call-1");
+        }
+      }
+      const taskCompleted = runtimeEvents.find(
+        (event) => event.type === "task.completed" && event.payload.taskId === "agent-1",
+      );
+      NodeAssert.equal(taskCompleted?.type, "task.completed");
+      if (taskCompleted?.type === "task.completed") {
+        NodeAssert.deepStrictEqual(taskCompleted.payload.typedUsage, {
+          totalTokens: 321,
+          toolUses: 1,
+          durationMs: 500,
+        });
+        NodeAssert.equal(taskCompleted.payload.summary, "Found the streaming path");
+      }
+      NodeAssert.equal(
+        runtimeEvents.some(
+          (event) =>
+            event.type === "content.delta" &&
+            event.payload.delta.includes("Found the streaming path"),
+        ),
+        false,
+      );
+
+      yield* adapter.stopSession(threadId);
     }),
   );
 
