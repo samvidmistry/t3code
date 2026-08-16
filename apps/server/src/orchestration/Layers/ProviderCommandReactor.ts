@@ -13,7 +13,6 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
-import { truncate } from "@t3tools/shared/String";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -40,6 +39,7 @@ import {
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
+import { canReplaceThreadTitle, DEFAULT_THREAD_TITLE } from "../threadTitles.ts";
 import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
@@ -93,7 +93,6 @@ const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
-const DEFAULT_THREAD_TITLE = "New thread";
 const MAX_REGENERATION_ATTACHMENTS = 4;
 const MAX_THREAD_TITLE_CONTEXT_CHARS = 8_000;
 const MAX_FIRST_USER_TITLE_CONTEXT_CHARS = 2_000;
@@ -226,50 +225,6 @@ export function providerErrorLabelFromInstanceHint(input: {
 }): string {
   return providerErrorLabel(
     input.instanceId ?? input.modelSelectionInstanceId ?? input.sessionProvider,
-  );
-}
-
-function normalizeTitleSeedCandidate(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function canReplaceThreadTitle(
-  currentTitle: string,
-  titleSeed?: string,
-  sourceMessageText?: string,
-): boolean {
-  const trimmedCurrentTitle = currentTitle.trim();
-  if (trimmedCurrentTitle === DEFAULT_THREAD_TITLE) {
-    return true;
-  }
-
-  const trimmedTitleSeed = titleSeed?.trim();
-  if (trimmedTitleSeed === undefined || trimmedTitleSeed.length === 0) {
-    return false;
-  }
-
-  if (trimmedCurrentTitle === trimmedTitleSeed) {
-    return true;
-  }
-
-  // Truncated seed expansion matching is only valid for client titles that
-  // explicitly use an ellipsis marker.
-  if (!trimmedTitleSeed.endsWith("...")) {
-    return false;
-  }
-
-  const normalizedCurrentTitle = normalizeTitleSeedCandidate(trimmedCurrentTitle);
-  const normalizedSourceMessage = sourceMessageText
-    ? normalizeTitleSeedCandidate(sourceMessageText)
-    : undefined;
-  const seededFromExpandedPrompt =
-    normalizedSourceMessage !== undefined && normalizedCurrentTitle === normalizedSourceMessage;
-  if (!seededFromExpandedPrompt) {
-    return false;
-  }
-
-  return (
-    truncate(trimmedCurrentTitle, Math.max(0, trimmedTitleSeed.length - 3)) === trimmedTitleSeed
   );
 }
 
@@ -660,6 +615,7 @@ const make = Effect.gen(function* () {
         ...(preferredProvider ? { provider: preferredProvider } : {}),
         providerInstanceId: desiredInstanceId,
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+        ...(thread.title ? { title: thread.title } : {}),
         modelSelection: desiredModelSelection,
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         runtimeMode: desiredRuntimeMode,
