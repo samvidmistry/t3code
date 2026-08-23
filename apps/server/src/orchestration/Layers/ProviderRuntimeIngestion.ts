@@ -875,6 +875,7 @@ export function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.title ? { title: event.payload.title } : {}),
+            ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined || event.itemId !== undefined
@@ -905,6 +906,7 @@ export function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.title ? { title: event.payload.title } : {}),
+            ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined || event.itemId !== undefined
@@ -935,6 +937,7 @@ export function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.title ? { title: event.payload.title } : {}),
+            ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined || event.itemId !== undefined
