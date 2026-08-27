@@ -167,13 +167,17 @@ describe("projectActivityPayload", () => {
       data: {
         item: {
           command: ["bash", "-lc", "pnpm test"],
-          input: { command: "fallback input" },
+          input: { command: "fallback input", ignored: "input bulk" },
           result: { command: "fallback result" },
         },
         command: "fallback data",
         toolCallId: "tool-command",
         kind: "execute",
-        rawOutput: { content: "first useful line" },
+        rawOutput: {
+          content: "\n```\nfirst useful line\nsecond line",
+          stdout: "unused stdout",
+          ignored: "raw bulk",
+        },
       },
     });
 
@@ -215,7 +219,10 @@ describe("projectActivityPayload", () => {
         });
         continue;
       }
-      expect(deriveWorkLogEntries([projected])).toEqual(deriveWorkLogEntries([activity]));
+      const [projectedEntry] = deriveWorkLogEntries([projected]);
+      const [sourceEntry] = deriveWorkLogEntries([activity]);
+      expect(projectedEntry?.toolOutput).toEqual(sourceEntry?.toolOutput);
+      expect(projectedEntry?.detail).toEqual(sourceEntry?.detail);
       expect(comparableThreadFeed([projected])).toEqual(comparableThreadFeed([activity]));
     }
   });

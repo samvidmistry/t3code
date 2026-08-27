@@ -1182,6 +1182,25 @@ describe("deriveWorkLogEntries", () => {
     const [entry] = deriveWorkLogEntries(activities);
     expect(entry?.toolTitle).toBe("t3-code · preview_status");
     expect(entry?.toolData).toEqual(item);
+    expect(entry?.toolOutput).toEqual(item.result);
+  });
+
+  it("preserves complete generic tool input for expanded display", () => {
+    const input = { thoughts: "Full thought text after the abbreviated preview." };
+    const [entry] = deriveWorkLogEntries([
+      makeActivity({
+        id: "think-done",
+        kind: "tool.completed",
+        summary: "Think",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Think",
+          detail: "Full thought text...",
+          data: { item: { toolName: "Think", input } },
+        },
+      }),
+    ]);
+    expect(entry?.toolData).toEqual({ toolName: "Think", input });
   });
 
   it("keeps MCP payloads while collapsing lifecycle updates", () => {
@@ -1645,6 +1664,9 @@ describe("deriveWorkLogEntries", () => {
       toolTitle: "Read File",
       detail: 'import * as Effect from "effect/Effect"',
       itemType: "dynamic_tool_call",
+      toolOutput: {
+        content: 'import * as Effect from "effect/Effect"\nimport * as Layer from "effect/Layer"\n',
+      },
     });
   });
 
@@ -1681,6 +1703,11 @@ describe("deriveWorkLogEntries", () => {
     });
     expect(entry?.detail).toBeUndefined();
     expect(entry?.command).toBeUndefined();
+    expect(entry?.toolOutput).toEqual({
+      exitCode: 0,
+      stdout: "total 960\napps\npackages\n",
+      stderr: "",
+    });
   });
 
   it("collapses legacy completed tool rows that are missing tool metadata", () => {

@@ -87,39 +87,20 @@ function projectCommandData(data: Record<string, unknown>): Record<string, unkno
   }
 
   const projectedItem: Record<string, unknown> = {};
+  if ("toolName" in item) {
+    projectedItem.toolName = item.toolName;
+  }
   if ("command" in item) {
     projectedItem.command = item.command;
   }
 
-  const aggregatedOutput = asTrimmedString(item.aggregatedOutput);
-  if (aggregatedOutput) {
-    const summary = summarizeToolTextOutput(aggregatedOutput);
-    if (summary) {
-      projectedItem.aggregatedOutput = summary;
-    }
-  }
-
-  const input = asRecord(item.input);
-  if (input && "command" in input) {
-    projectedItem.input = { command: input.command };
+  if ("input" in item) {
+    projectedItem.input = item.input;
   }
 
   const result = asRecord(item.result);
-  if (result) {
-    const projectedResult: Record<string, unknown> = {};
-    if ("command" in result) {
-      projectedResult.command = result.command;
-    }
-    const content = asTrimmedString(result.content);
-    if (content) {
-      const summary = summarizeToolTextOutput(content);
-      if (summary) {
-        projectedResult.content = summary;
-      }
-    }
-    if (Object.keys(projectedResult).length > 0) {
-      projectedItem.result = projectedResult;
-    }
+  if (result && "command" in result) {
+    projectedItem.result = { command: result.command };
   }
 
   return Object.keys(projectedItem).length > 0 ? projectedItem : undefined;
@@ -143,25 +124,6 @@ function projectCommandValue(data: Record<string, unknown>): unknown {
   return undefined;
 }
 
-function summarizeToolTextOutput(value: string): string | null {
-  const lines: string[] = [];
-  for (const rawLine of value.split(/\r?\n/u)) {
-    const line = rawLine.replace(/\s+/g, " ").trim();
-    if (line.length > 0) {
-      lines.push(line);
-    }
-  }
-
-  const firstLine = lines.find((line) => line !== "```");
-  if (firstLine) {
-    return firstLine.length <= 84 ? firstLine : `${firstLine.slice(0, 83).trimEnd()}…`;
-  }
-  if (lines.length > 1) {
-    return `${lines.length.toLocaleString()} lines`;
-  }
-  return null;
-}
-
 /**
  * Fields of an MCP tool-call item both clients render in the expanded
  * work-log row. Everything else — notably `result`, which carries the full
@@ -181,47 +143,9 @@ const MCP_ITEM_KEPT_FIELDS = [
 ] as const;
 
 /**
- * Pulls renderable text out of an MCP tool result: either a Codex-style
- * `{content: [{type: "text", text}, ...]}` record or a raw Claude
- * `tool_result` block whose `content` is a string or block array.
- */
-function extractMcpResultText(result: unknown): string | null {
-  const record = asRecord(result);
-  if (!record) {
-    return typeof result === "string" ? result : null;
-  }
-  if (typeof record.content === "string") {
-    return record.content;
-  }
-  if (Array.isArray(record.content)) {
-    const texts: string[] = [];
-    for (const entry of record.content) {
-      const text = asRecord(entry)?.text;
-      if (typeof text === "string" && text.trim().length > 0) {
-        texts.push(text);
-      }
-    }
-    if (texts.length > 0) {
-      return texts.join("\n");
-    }
-  }
-  return null;
-}
-
-function summarizeMcpResult(result: unknown): Record<string, unknown> | undefined {
-  if (result === undefined || result === null) {
-    return undefined;
-  }
-  const text = extractMcpResultText(result);
-  const summary = text ? summarizeToolTextOutput(text) : null;
-  return summary ? { content: summary } : undefined;
-}
-
-/**
  * MCP tool calls carry full tool results (`data.item.result` on Codex,
- * `data.result` on Claude/OpenCode) that used to bypass slimming entirely to
- * keep the expanded-row UI working. Keep the fields the UI actually renders
- * and summarize the result like regular tool output.
+ * `data.result` on Claude/OpenCode). Keep those results intact so clients can
+ * show the complete output when a tool row is expanded.
  */
 function projectMcpToolCallData(data: Record<string, unknown>): Record<string, unknown> {
   const projectedData: Record<string, unknown> = {};
@@ -234,9 +158,8 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
         projectedItem[key] = item[key];
       }
     }
-    const result = summarizeMcpResult(item.result);
-    if (result) {
-      projectedItem.result = result;
+    if ("result" in item) {
+      projectedItem.result = item.result;
     }
     projectedData.item = projectedItem;
   }
@@ -248,9 +171,8 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
     projectedData.input = data.input;
   }
   if (!item) {
-    const result = summarizeMcpResult(data.result);
-    if (result) {
-      projectedData.result = result;
+    if ("result" in data) {
+      projectedData.result = data.result;
     }
   }
 
@@ -268,65 +190,6 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
   }
 
   return projectedData;
-}
-
-function projectRawOutput(value: unknown): Record<string, unknown> | undefined {
-  const direct = asTrimmedString(value);
-  if (direct) {
-    const summary = summarizeToolTextOutput(direct);
-    return summary ? { content: summary } : undefined;
-  }
-
-  const rawOutput = asRecord(value);
-  if (!rawOutput) {
-    return undefined;
-  }
-
-  if (typeof rawOutput.totalFiles === "number" && Number.isFinite(rawOutput.totalFiles)) {
-    return {
-      totalFiles: rawOutput.totalFiles,
-      ...(rawOutput.truncated === true ? { truncated: true } : {}),
-    };
-  }
-
-  const content = asTrimmedString(rawOutput.content);
-  if (content) {
-    const summary = summarizeToolTextOutput(content);
-    return summary ? { content: summary } : undefined;
-  }
-
-  const stdout = asTrimmedString(rawOutput.stdout);
-  if (stdout) {
-    const summary = summarizeToolTextOutput(stdout);
-    return summary ? { content: summary } : undefined;
-  }
-
-  const stderr = asTrimmedString(rawOutput.stderr);
-  if (stderr) {
-    const summary = summarizeToolTextOutput(stderr);
-    return summary ? { content: summary } : undefined;
-  }
-
-  return undefined;
-}
-
-function projectAcpContent(value: unknown): Record<string, unknown> | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  const text = value
-    .map((entryValue) => {
-      const entry = asRecord(entryValue);
-      const content = asRecord(entry?.content);
-      return entry?.type === "content" && content?.type === "text"
-        ? asTrimmedString(content.text)
-        : null;
-    })
-    .filter((entry): entry is string => entry !== null)
-    .join("\n");
-  const summary = summarizeToolTextOutput(text);
-  return summary ? { content: summary } : undefined;
 }
 
 /**
@@ -367,6 +230,9 @@ export function projectActivityPayload(
   if (command !== undefined) {
     projectedData.command = command;
   }
+  if ("rawInput" in data) {
+    projectedData.rawInput = data.rawInput;
+  }
 
   const changedFiles: string[] = [];
   collectChangedFiles(data, changedFiles, new Set<string>(), 0);
@@ -382,9 +248,8 @@ export function projectActivityPayload(
     projectedData.kind = data.kind;
   }
 
-  const rawOutput = projectRawOutput(data.rawOutput) ?? projectAcpContent(data.content);
-  if (rawOutput) {
-    projectedData.rawOutput = rawOutput;
+  if ("rawOutput" in data) {
+    projectedData.rawOutput = data.rawOutput;
   }
 
   return {

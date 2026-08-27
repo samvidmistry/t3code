@@ -2433,7 +2433,28 @@ function buildToolCallExpandedBody(
   const blocks: string[] = [];
   if (workEntry.toolData !== undefined) {
     const label = workEntry.itemType === "mcp_tool_call" ? "MCP call" : "Provider details";
-    blocks.push(`${label}\n${JSON.stringify(workEntry.toolData, null, 2)}`);
+    const toolData =
+      workEntry.toolOutput !== undefined &&
+      workEntry.toolData !== null &&
+      typeof workEntry.toolData === "object" &&
+      !Array.isArray(workEntry.toolData) &&
+      (workEntry.toolData as Record<string, unknown>).result === workEntry.toolOutput
+        ? Object.fromEntries(
+            Object.entries(workEntry.toolData as Record<string, unknown>).filter(
+              ([key]) => key !== "result",
+            ),
+          )
+        : workEntry.toolData;
+    blocks.push(`${label}\n${JSON.stringify(toolData, null, 2)}`);
+  }
+  if (workEntry.toolOutput !== undefined) {
+    const output =
+      typeof workEntry.toolOutput === "string"
+        ? workEntry.toolOutput
+        : JSON.stringify(workEntry.toolOutput, null, 2);
+    if (output?.trim()) {
+      blocks.push(`Output\n${output.trim()}`);
+    }
   }
   const raw = workEntryRawCommand(workEntry);
   if (raw?.trim()) {
@@ -2458,6 +2479,7 @@ function buildToolCallExpandedBody(
 function workEntryCanExpand(workEntry: TimelineWorkEntry): boolean {
   return Boolean(
     workEntry.toolData !== undefined ||
+    workEntry.toolOutput !== undefined ||
     workEntry.rawCommand?.trim() ||
     workEntry.command?.trim() ||
     workEntry.detail?.trim() ||

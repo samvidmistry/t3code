@@ -82,6 +82,7 @@ export interface WorkLogEntry {
   tone: "thinking" | "tool" | "info" | "error";
   toolTitle?: string;
   toolData?: unknown;
+  toolOutput?: unknown;
   itemType?: ToolLifecycleItemType;
   requestKind?: PendingApproval["requestKind"];
   /** From runtime item / task payload `status` when present (e.g. tool.updated). */
@@ -968,6 +969,16 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const data = asRecord(payload?.data);
   if (data?.item !== undefined) {
     entry.toolData = data.item;
+  } else if (data?.rawInput !== undefined) {
+    entry.toolData = data.rawInput;
+  }
+  const item = asRecord(data?.item);
+  if (data?.rawOutput !== undefined) {
+    entry.toolOutput = data.rawOutput;
+  } else if (item?.result !== undefined) {
+    entry.toolOutput = item.result;
+  } else if (data?.result !== undefined) {
+    entry.toolOutput = data.result;
   }
   if (itemType) {
     entry.itemType = itemType;
@@ -1208,6 +1219,7 @@ function mergeDerivedWorkLogEntries(
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  const toolOutput = next.toolOutput ?? previous.toolOutput;
   return {
     ...previous,
     ...next,
@@ -1222,6 +1234,7 @@ function mergeDerivedWorkLogEntries(
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolLifecycleStatus !== undefined ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
+    ...(toolOutput !== undefined ? { toolOutput } : {}),
   };
 }
 

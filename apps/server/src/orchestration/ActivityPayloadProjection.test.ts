@@ -21,6 +21,26 @@ function activity(payload: Record<string, unknown>): OrchestrationThreadActivity
  * assertions are the tripwire.
  */
 describe("projectActivityPayload", () => {
+  it("preserves complete generic tool inputs for expanded rows", () => {
+    const thoughts = "A complete line of reasoning that must not end with an ellipsis.";
+    const projected = projectActivityPayload(
+      activity({
+        itemType: "dynamic_tool_call",
+        title: "Think",
+        detail: `${thoughts.slice(0, 20)}...`,
+        data: {
+          toolCallId: "think-1",
+          item: { toolName: "Think", input: { thoughts } },
+        },
+      }),
+    );
+    const payload = projected.payload as { data: { item: unknown } };
+    expect(payload.data.item).toEqual({
+      toolName: "Think",
+      input: { thoughts },
+    });
+  });
+
   it("preserves tool attribution (agentId/parentToolUseId) through data slimming", () => {
     const projected = projectActivityPayload(
       activity({
@@ -42,59 +62,6 @@ describe("projectActivityPayload", () => {
     // Slimming itself still applies to data.
     const data = payload.data as Record<string, unknown>;
     expect(data.somethingClientNeverReads).toBeUndefined();
-  });
-
-  it("keeps a bounded Codex command output summary", () => {
-    const projected = projectActivityPayload(
-      activity({
-        itemType: "command_execution",
-        data: {
-          item: {
-            command: "/bin/zsh -lc 'printf hello'",
-            aggregatedOutput: `hello from codex\n${"x".repeat(5000)}`,
-          },
-        },
-      }),
-    );
-    const data = (projected.payload as Record<string, unknown>).data as Record<string, unknown>;
-    expect(data.item).toEqual({
-      command: "/bin/zsh -lc 'printf hello'",
-      aggregatedOutput: "hello from codex",
-    });
-    expect(JSON.stringify(projected.payload).length).toBeLessThan(500);
-  });
-
-  it("keeps bounded Claude and ACP command output summaries", () => {
-    const claude = projectActivityPayload(
-      activity({
-        itemType: "command_execution",
-        data: {
-          command: "printf hello",
-          rawOutput: { stdout: `hello from claude\n${"y".repeat(5000)}` },
-        },
-      }),
-    );
-    const acp = projectActivityPayload(
-      activity({
-        itemType: "command_execution",
-        data: {
-          command: "printf hello",
-          content: [
-            {
-              type: "content",
-              content: { type: "text", text: `hello from acp\n${"z".repeat(5000)}` },
-            },
-          ],
-        },
-      }),
-    );
-
-    const claudeData = (claude.payload as Record<string, unknown>).data as Record<string, unknown>;
-    const acpData = (acp.payload as Record<string, unknown>).data as Record<string, unknown>;
-    expect(claudeData.rawOutput).toEqual({ content: "hello from claude" });
-    expect(acpData.rawOutput).toEqual({ content: "hello from acp" });
-    expect(JSON.stringify(claude.payload).length).toBeLessThan(500);
-    expect(JSON.stringify(acp.payload).length).toBeLessThan(500);
   });
 
   it("normalizes Claude and OpenCode command inputs before slimming provider data", () => {
@@ -136,7 +103,7 @@ describe("projectActivityPayload", () => {
     expect(JSON.stringify(openCode.payload).length).toBeLessThan(200);
   });
 
-  it("slims Codex-shaped mcp_tool_call items to rendered fields plus a result summary", () => {
+  it("preserves full Codex-shaped MCP results", () => {
     const projected = projectActivityPayload(
       activity({
         itemType: "mcp_tool_call",
@@ -164,11 +131,13 @@ describe("projectActivityPayload", () => {
     expect(item.server).toBe("github");
     expect(item.arguments).toEqual({ pr: 42 });
     expect(item._meta).toBeUndefined();
-    expect(item.result).toEqual({ content: "PR body line one" });
-    expect(JSON.stringify(projected.payload).length).toBeLessThan(500);
+    expect(item.result).toEqual({
+      content: [{ type: "text", text: `PR body line one\n${"x".repeat(5000)}` }],
+      structuredContent: { huge: "y".repeat(5000) },
+    });
   });
 
-  it("slims Claude-shaped mcp_tool_call data (toolName/input/result block)", () => {
+  it("preserves full Claude-shaped MCP results", () => {
     const projected = projectActivityPayload(
       activity({
         itemType: "mcp_tool_call",
@@ -186,8 +155,11 @@ describe("projectActivityPayload", () => {
     const data = (projected.payload as Record<string, unknown>).data as Record<string, unknown>;
     expect(data.toolName).toBe("mcp__github__fetch_pr");
     expect(data.input).toEqual({ pr: 42 });
-    expect(data.result).toEqual({ content: "first line of output" });
-    expect(JSON.stringify(projected.payload).length).toBeLessThan(500);
+    expect(data.result).toEqual({
+      type: "tool_result",
+      tool_use_id: "toolu_1",
+      content: [{ type: "text", text: `first line of output\n${"z".repeat(5000)}` }],
+    });
   });
 
   it("passes task lifecycle payloads (no data field) through untouched", () => {
