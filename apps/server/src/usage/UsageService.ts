@@ -222,6 +222,10 @@ export const make = Effect.gen(function* () {
     return [
       { provider: "claude" as const, dir: claudeDir },
       { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
+      // Pi has no configurable home: it always writes under `~/.pi/agent`, and
+      // its settings carry no path to honour. A missing directory reports as
+      // `missing` like any other absent provider.
+      { provider: "pi" as const, dir: path.join(NodeOS.homedir(), ".pi", "agent", "sessions") },
     ];
   });
 

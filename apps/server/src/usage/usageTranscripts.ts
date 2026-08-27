@@ -1,8 +1,8 @@
 /**
  * Pure parsers for the provider CLIs' on-disk session transcripts.
  *
- * Both parsers are line-at-a-time reducers so callers can stream large files
- * without materialising them. Neither touches the filesystem.
+ * The parsers are line-at-a-time reducers so callers can stream large files
+ * without materialising them. None of them touches the filesystem.
  *
  * @module usageTranscripts
  */
@@ -68,7 +68,7 @@ export function totalTokens(totals: UsageTokenTotals): number {
  * an order of magnitude.
  */
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
-  return provider === "claude" ? line.includes('"usage"') : line.includes('"token_count"');
+  return provider === "codex" ? line.includes('"token_count"') : line.includes('"usage"');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -294,6 +294,115 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
     // Events surviving the fork-copy suppression above are unique to this
     // rollout, so they need no global dedup.
     dedupeKey: null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Pi                                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Rolling state for a single Pi session file.
+ *
+ * Pi's session id lives on the leading `session` line rather than on the
+ * message records, so it is carried forward the way Codex's model is.
+ */
+export interface PiScanState {
+  sessionId: string;
+}
+
+export function initialPiScanState(): PiScanState {
+  return { sessionId: "" };
+}
+
+/**
+ * Feeds one line of a Pi session file into `state`, returning a record when the
+ * line was an assistant message carrying usage.
+ *
+ * Pi writes one record per assistant response, each with a self-contained
+ * `usage` block, so unlike Claude there is nothing to collapse. It also prices
+ * the response itself, which is the only figure that reflects the account's
+ * actual gateway rates — the model slugs it reports (`gpt-5.6-sol`,
+ * account-specific Copilot names) are absent from the LiteLLM table, so without
+ * the reported cost every Pi bucket would report as unpriced.
+ */
+export function parsePiLine(line: string, state: PiScanState): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const record = parsed as Record<string, unknown>;
+
+  if (record["type"] === "session") {
+    if (typeof record["id"] === "string") state.sessionId = record["id"];
+    return null;
+  }
+
+  if (record["type"] !== "message") return null;
+
+  const message = record["message"];
+  if (typeof message !== "object" || message === null) return null;
+  const messageRecord = message as Record<string, unknown>;
+  if (messageRecord["role"] !== "assistant") return null;
+
+  const usage = messageRecord["usage"];
+  if (typeof usage !== "object" || usage === null) return null;
+  const usageRecord = usage as Record<string, unknown>;
+
+  const model = typeof messageRecord["model"] === "string" ? messageRecord["model"] : "";
+  if (model.length === 0) return null;
+
+  // The envelope timestamp is the ISO one; `message.timestamp` is epoch millis
+  // and only used when the envelope is missing it.
+  const envelopeMs = parseTimestampMs(record["timestamp"]);
+  const messageMs = messageRecord["timestamp"];
+  const timestampMs =
+    envelopeMs ?? (typeof messageMs === "number" && Number.isFinite(messageMs) ? messageMs : null);
+  if (timestampMs === null) return null;
+
+  const outputTokens = int(usageRecord["output"]);
+  const totals: UsageTokenTotals = {
+    // Pi reports `input` exclusive of both cache figures: the four add up to
+    // its own `totalTokens`.
+    uncachedInputTokens: int(usageRecord["input"]),
+    cachedInputTokens: int(usageRecord["cacheRead"]),
+    // Extended-TTL writes are billed as cache creation just like the 5m ones.
+    cacheCreationTokens: int(usageRecord["cacheWrite"]) + int(usageRecord["cacheWrite1h"]),
+    outputTokens,
+    // Reported inside output, surfaced separately for the token mix.
+    reasoningTokens: Math.min(outputTokens, int(usageRecord["reasoning"])),
+  };
+
+  // Aborted and errored turns are written with an all-zero usage block and no
+  // response id. They are not usage, and letting them through would inflate the
+  // record counts the cost-quality shares are computed over.
+  if (totalTokens(totals) === 0) return null;
+
+  const cost = usageRecord["cost"];
+  const reportedCostUsd =
+    typeof cost === "object" && cost !== null
+      ? (() => {
+          const total = (cost as Record<string, unknown>)["total"];
+          return typeof total === "number" && Number.isFinite(total) ? total : null;
+        })()
+      : null;
+
+  const responseId = messageRecord["responseId"];
+
+  return {
+    provider: "pi",
+    timestampMs,
+    model,
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd,
+    // Pi does not copy history into resumed or forked session files, so this is
+    // belt and braces rather than load-bearing.
+    dedupeKey: typeof responseId === "string" && responseId.length > 0 ? responseId : null,
   };
 }
 

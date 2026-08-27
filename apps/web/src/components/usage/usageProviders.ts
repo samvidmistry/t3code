@@ -1,6 +1,6 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 
-import { ClaudeAI, type Icon, OpenAI } from "../Icons";
+import { ClaudeAI, type Icon, OpenAI, PiAgentIcon } from "../Icons";
 
 type UsageProviderPresentation = {
   readonly label: string;
@@ -8,11 +8,7 @@ type UsageProviderPresentation = {
   readonly mark: Icon;
 };
 
-/**
- * Exhaustive presentation for providers supported by the usage contract.
- * Declaration order is reused by every chart, table, legend, and skeleton, so
- * adding a provider only requires its contract support and one entry here.
- */
+/** Shared presentation for every provider supported by the usage contract. */
 export const PROVIDER_PRESENTATION = {
   codex: {
     label: "Codex",
@@ -23,6 +19,11 @@ export const PROVIDER_PRESENTATION = {
     label: "Claude Code",
     color: "#d97757",
     mark: ClaudeAI,
+  },
+  pi: {
+    label: "Pi",
+    color: "#a78bfa",
+    mark: PiAgentIcon,
   },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
