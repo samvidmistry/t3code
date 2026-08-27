@@ -554,7 +554,7 @@ describe("deriveMessagesTimelineRows", () => {
     ).toBeDefined();
   });
 
-  it("folds assistant messages between the first and terminal messages", () => {
+  it("keeps middle assistant messages visible and only folds work", () => {
     const timelineEntries = [
       {
         id: "assistant-first-entry",
@@ -571,6 +571,18 @@ describe("deriveMessagesTimelineRows", () => {
         },
       },
       {
+        id: "work-entry-1",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:02.500Z",
+        entry: {
+          id: "work-1",
+          createdAt: "2026-01-01T00:00:02.500Z",
+          turnId: "turn-1" as never,
+          label: "Ran command",
+          tone: "tool" as const,
+        },
+      },
+      {
         id: "assistant-middle-entry",
         kind: "message" as const,
         createdAt: "2026-01-01T00:00:03Z",
@@ -582,6 +594,18 @@ describe("deriveMessagesTimelineRows", () => {
           createdAt: "2026-01-01T00:00:03Z",
           updatedAt: "2026-01-01T00:00:04Z",
           streaming: false,
+        },
+      },
+      {
+        id: "work-entry-2",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:04.500Z",
+        entry: {
+          id: "work-2",
+          createdAt: "2026-01-01T00:00:04.500Z",
+          turnId: "turn-1" as never,
+          label: "Ran command",
+          tone: "tool" as const,
         },
       },
       {
@@ -611,6 +635,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(rows.map((row) => row.id)).toEqual([
       "assistant-first-entry",
       "turn-fold:turn-1",
+      "assistant-middle-entry",
       "assistant-final-entry",
     ]);
   });

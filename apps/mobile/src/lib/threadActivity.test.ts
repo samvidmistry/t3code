@@ -636,7 +636,7 @@ describe("buildThreadFeed", () => {
     ]);
   });
 
-  it("folds assistant messages between the first and terminal messages", () => {
+  it("keeps middle assistant messages visible and only folds work", () => {
     const turnId = TurnId.make("turn-1");
     const thread = makeThread({
       id: ThreadId.make("thread-middle-message"),
@@ -679,6 +679,34 @@ describe("buildThreadFeed", () => {
           updatedAt: "2026-04-01T00:00:06.000Z",
         },
       ],
+      activities: [
+        makeActivity({
+          id: EventId.make("work-1"),
+          kind: "tool.completed",
+          tone: "tool",
+          summary: "Ran command",
+          createdAt: "2026-04-01T00:00:02.500Z",
+          turnId,
+          payload: {
+            title: "Ran command",
+            itemType: "command_execution",
+            status: "completed",
+          },
+        }),
+        makeActivity({
+          id: EventId.make("work-2"),
+          kind: "tool.completed",
+          tone: "tool",
+          summary: "Ran command",
+          createdAt: "2026-04-01T00:00:04.500Z",
+          turnId,
+          payload: {
+            title: "Ran command",
+            itemType: "command_execution",
+            status: "completed",
+          },
+        }),
+      ],
     });
 
     const feed = buildThreadFeed(thread);
@@ -687,6 +715,7 @@ describe("buildThreadFeed", () => {
     expect(rows.map((entry) => entry.id)).toEqual([
       "assistant-first",
       "turn-fold:turn-1",
+      "assistant-middle",
       "assistant-final",
     ]);
   });
