@@ -8,6 +8,7 @@ import {
   classifyPiApprovalRequestType,
   classifyPiToolItemType,
   extractPiPartialResultText,
+  extractPiThinkText,
   isPiApprovalConfirmed,
   normalizePiTokenUsage,
   parseNumberedList,
@@ -105,6 +106,20 @@ describe("normalizePiTokenUsage", () => {
   });
 });
 
+describe("extractPiThinkText", () => {
+  it("extracts prose from think calls only", () => {
+    expect(extractPiThinkText("think", { thoughts: "  weigh it  " })).toBe("weigh it");
+    expect(extractPiThinkText("think", { thought: "singular key" })).toBe("singular key");
+    expect(extractPiThinkText("bash", { thoughts: "not a think call" })).toBeUndefined();
+  });
+
+  it("ignores think calls with no usable prose", () => {
+    expect(extractPiThinkText("think", { thoughts: "   " })).toBeUndefined();
+    expect(extractPiThinkText("think", {})).toBeUndefined();
+    expect(extractPiThinkText("think", undefined)).toBeUndefined();
+  });
+});
+
 describe("summarizePiToolArgs", () => {
   it("prefers the command, then path, then pattern fields", () => {
     expect(summarizePiToolArgs({ command: "ls -la" })).toBe("ls -la");
@@ -112,8 +127,15 @@ describe("summarizePiToolArgs", () => {
     expect(summarizePiToolArgs({ query: "find TODOs" })).toBe("find TODOs");
   });
 
-  it("serializes other objects and ignores non-objects", () => {
-    expect(summarizePiToolArgs({ foo: "bar" })).toBe('{"foo":"bar"}');
+  it("summarizes prose-carrying tools like think", () => {
+    expect(summarizePiToolArgs({ thoughts: "Weigh the merge options" })).toBe(
+      "Weigh the merge options",
+    );
+    expect(summarizePiToolArgs({ prompt: "Research the API" })).toBe("Research the API");
+  });
+
+  it("returns undefined for undescribable args so the row falls back to the tool name", () => {
+    expect(summarizePiToolArgs({ foo: "bar" })).toBeUndefined();
     expect(summarizePiToolArgs(undefined)).toBeUndefined();
     expect(summarizePiToolArgs("string")).toBeUndefined();
   });

@@ -185,6 +185,8 @@ interface PiSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<PiToolItem> }>;
   // parent `subagent` toolCallId -> child index -> child task state
   readonly subagentTasks: Map<string, Map<number, SubagentChildTaskState>>;
+  // `think` toolCallIds routed to reasoning; their update/end events emit no tool row
+  readonly thinkItemIds: Set<string>;
   stopped: boolean;
   // slug the pi process is running; used to issue set_model only on change
   currentModel: string | undefined;
@@ -304,6 +306,26 @@ function normalizePiSubagentUsage(
   };
 }
 
+/**
+ * Pi's bundled `think` tool is reflection, not an action: it has no output to
+ * expand and cannot fail. Rendering it as a tool row buries the prose behind a
+ * generic label, so it maps to the canonical reasoning stream instead.
+ *
+ * Keyed on the tool call id (never the assistant item) so each call renders as
+ * its own row — ingestion coalesces deltas per item, and a shared key would
+ * merge every reflection in the turn into one growing blob.
+ */
+export function extractPiThinkText(toolName: string, args: unknown): string | undefined {
+  if (toolName !== "think") return undefined;
+  if (!args || typeof args !== "object") return undefined;
+  const input = args as Record<string, unknown>;
+  for (const key of ["thoughts", "thought"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
 export function extractPiPartialResultText(partial: unknown): string | undefined {
   if (partial === undefined || partial === null) return undefined;
   if (typeof partial === "string") return partial;
@@ -340,21 +362,29 @@ export function extractPiPartialResultText(partial: unknown): string | undefined
   }
 }
 
+/**
+ * The work-log row renders this preview *instead of* the tool name, so a
+ * summary has to read as a human-legible phrase on its own. Keys are probed
+ * from most to least specific; anything we cannot describe returns undefined
+ * so the row falls back to the tool name rather than dumping raw JSON.
+ */
 export function summarizePiToolArgs(args: unknown): string | undefined {
   if (!args || typeof args !== "object") return undefined;
   const input = args as Record<string, unknown>;
-  const command = input["command"] ?? input["cmd"];
-  if (typeof command === "string" && command.trim().length > 0) return command.trim().slice(0, 400);
-  const path = input["file_path"] ?? input["path"] ?? input["filePath"];
-  if (typeof path === "string" && path.trim().length > 0) return path.trim().slice(0, 400);
-  const pattern = input["pattern"] ?? input["query"] ?? input["description"];
-  if (typeof pattern === "string" && pattern.trim().length > 0) return pattern.trim().slice(0, 400);
-  try {
-    const serialized = JSON.stringify(input);
-    return serialized.length <= 400 ? serialized : `${serialized.slice(0, 397)}...`;
-  } catch {
+  const firstString = (...keys: ReadonlyArray<string>): string | undefined => {
+    for (const key of keys) {
+      const value = input[key];
+      if (typeof value === "string" && value.trim().length > 0) return value.trim().slice(0, 400);
+    }
     return undefined;
-  }
+  };
+  return (
+    firstString("command", "cmd") ??
+    firstString("file_path", "path", "filePath") ??
+    // `think` and note-style tools carry their whole payload in a prose field
+    firstString("thoughts", "thought", "prompt", "task", "text", "content") ??
+    firstString("pattern", "query", "description", "url")
+  );
 }
 
 // Pi encodes an RPC multi-select as `Title\n1. A\n2. B`
@@ -655,6 +685,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         state === "completed" ? "completed" : state === "failed" ? "failed" : "stopped",
       );
       context.turnState = undefined;
+      context.thinkItemIds.clear();
       context.turns.push({ id: turnState.turnId, items: [...turnState.items] });
 
       const updatedAt = yield* nowIso;
@@ -794,6 +825,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         case "tool_execution_start": {
           if (!context.turnState) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
+
+          // `think` renders as reasoning, not a tool row. The whole payload
+          // arrives at once, so this single delta is the complete text.
+          const thinkText = extractPiThinkText(event.toolName, event.args);
+          if (thinkText !== undefined) {
+            context.thinkItemIds.add(event.toolCallId);
+            yield* offerRuntimeEvent({
+              ...base,
+              turnId: context.turnState.turnId,
+              itemId,
+              type: "content.delta",
+              payload: { streamKind: "reasoning_text", delta: thinkText },
+            });
+            return;
+          }
+
           const itemType = classifyPiToolItemType(event.toolName);
           const detail = summarizePiToolArgs(event.args);
           const argsObj =
@@ -824,6 +871,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
         case "tool_execution_update": {
           if (!context.turnState) return;
+          if (context.thinkItemIds.has(event.toolCallId)) return;
           const partial = (event as { partialResult?: unknown }).partialResult;
           if (partial === undefined) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
@@ -862,6 +910,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
         case "tool_execution_end": {
           if (!context.turnState) return;
+          // Already rendered as reasoning at start; `think` has no output to settle.
+          if (context.thinkItemIds.delete(event.toolCallId)) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
           const itemType = classifyPiToolItemType(event.toolName);
 
@@ -886,6 +936,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             storedItem?.args && typeof storedItem.args === "object"
               ? (storedItem.args as Record<string, unknown>)
               : undefined;
+          // Expanded work-log rows read tool output from `data.item.result`;
+          // without it a settled Pi tool call expands to its input and nothing else.
+          const result = extractPiPartialResultText((event as { result?: unknown }).result);
           yield* offerRuntimeEvent({
             ...base,
             turnId: context.turnState.turnId,
@@ -896,7 +949,17 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               title: event.toolName,
               status: event.isError ? "failed" : "completed",
               ...(detail ? { detail } : {}),
-              ...(argsObj ? { data: { item: { toolName: event.toolName, input: argsObj } } } : {}),
+              ...(argsObj || result !== undefined
+                ? {
+                    data: {
+                      item: {
+                        toolName: event.toolName,
+                        ...(argsObj ? { input: argsObj } : {}),
+                        ...(result !== undefined ? { result } : {}),
+                      },
+                    },
+                  }
+                : {}),
             },
           });
           return;
@@ -1379,6 +1442,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       turnState: undefined,
       turns: [],
       subagentTasks: new Map(),
+      thinkItemIds: new Set(),
       stopped: false,
       currentModel: modelSelection?.model,
       currentContextWindow: undefined,

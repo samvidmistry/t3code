@@ -480,6 +480,15 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       const secondDeltaIndex = events.indexOf(assistantDeltas[1]!);
       expect(firstCompletionIndex).toBeLessThan(toolStartIndex);
       expect(toolStartIndex).toBeLessThan(secondDeltaIndex);
+
+      // Expanded work-log rows read output from `data.item.result`.
+      const toolCompletion = events.find(
+        (event) =>
+          event.type === "item.completed" && event.payload.itemType === "dynamic_tool_call",
+      );
+      expect(toolCompletion?.payload).toMatchObject({
+        data: { item: { toolName: "read", input: { path: "src/app.ts" }, result: "contents" } },
+      });
     }),
   );
 
@@ -608,9 +617,74 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       }
       if (completed && completed.type === "item.completed") {
         expect(completed.payload.data).toEqual({
-          item: { toolName: "bash", input: { command: "ls" } },
+          item: { toolName: "bash", input: { command: "ls" }, result: "file.txt" },
         });
       }
+    }),
+  );
+
+  it.effect("maps think calls to per-call reasoning deltas, not tool rows", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-int-think");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "reason it out", attachments: [] });
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "think-1",
+        toolName: "think",
+        args: { thoughts: "First consider the merge base." },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "think-1",
+        toolName: "think",
+        result: "ok",
+        isError: false,
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "think-2",
+        toolName: "think",
+        args: { thoughts: "Now verify the conflict list." },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "think-2",
+        toolName: "think",
+        result: "ok",
+        isError: false,
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({ type: "agent_end" } as AgentSessionEvent);
+
+      const events = yield* Fiber.join(collected.fiber).pipe(
+        Effect.flatMap(() => Ref.get(collected.store)),
+      );
+
+      // No tool rows: think is reflection, not an action.
+      expect(events.filter((event) => event.type === "item.started")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "item.completed")).toHaveLength(0);
+
+      const reasoning = events.filter(
+        (event) => event.type === "content.delta" && event.payload.streamKind === "reasoning_text",
+      );
+      expect(
+        reasoning.map((event) => event.type === "content.delta" && event.payload.delta),
+      ).toEqual(["First consider the merge base.", "Now verify the conflict list."]);
+      // Distinct itemIds keep each reflection its own row; a shared key would
+      // coalesce them into one growing blob in ingestion.
+      expect(new Set(reasoning.map((event) => event.itemId)).size).toBe(2);
     }),
   );
 
