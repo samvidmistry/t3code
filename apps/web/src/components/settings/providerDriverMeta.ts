@@ -1,7 +1,7 @@
 import {
+  AntigravitySettings,
   ClaudeSettings,
   CodexSettings,
-  CopilotSettings,
   CursorSettings,
   GrokSettings,
   OpenCodeSettings,
@@ -10,9 +10,9 @@ import {
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
 import {
+  AntigravityIcon,
   ClaudeAI,
   CursorIcon,
-  GithubCopilotIcon,
   GrokIcon,
   type Icon,
   OpenAI,
@@ -53,13 +53,6 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     settingsSchema: CodexSettings,
   },
   {
-    value: ProviderDriverKind.make("copilot"),
-    label: "GitHub Copilot",
-    icon: GithubCopilotIcon,
-    badgeLabel: "Early Access",
-    settingsSchema: CopilotSettings,
-  },
-  {
     value: ProviderDriverKind.make("claudeAgent"),
     label: "Claude",
     icon: ClaudeAI,
@@ -91,6 +84,12 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     icon: PiAgentIcon,
     badgeLabel: "Early Access",
     settingsSchema: PiSettings,
+  },
+  {
+    value: ProviderDriverKind.make("antigravity"),
+    label: "Antigravity",
+    icon: AntigravityIcon,
+    settingsSchema: AntigravitySettings,
   },
 ];
 

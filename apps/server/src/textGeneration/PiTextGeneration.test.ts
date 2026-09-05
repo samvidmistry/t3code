@@ -16,7 +16,7 @@ import { PiSettings, ProviderInstanceId, TextGenerationError } from "@t3tools/co
 
 import * as ServerConfig from "../config.ts";
 import { makePiTextGeneration } from "./PiTextGeneration.ts";
-import { type TextGenerationShape } from "./TextGeneration.ts";
+import { type TextGeneration } from "./TextGeneration.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const MOCK_PATH = NodePath.join(__dirname, "../../scripts/pi-mock-rpc.ts");
@@ -42,7 +42,7 @@ async function makePiWrapper(): Promise<string> {
 
 const withFakePi = <A, E>(
   mockEnv: Record<string, string>,
-  use: (textGeneration: TextGenerationShape) => Effect.Effect<A, E, never>,
+  use: (textGeneration: TextGeneration["Service"]) => Effect.Effect<A, E, never>,
 ) =>
   Effect.gen(function* () {
     const wrapperPath = yield* Effect.promise(() => makePiWrapper());

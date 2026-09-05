@@ -511,7 +511,7 @@ export function initialPiScanState(): PiScanState {
  * `usage` block, so unlike Claude there is nothing to collapse. It also prices
  * the response itself, which is the only figure that reflects the account's
  * actual gateway rates — the model slugs it reports (`gpt-5.6-sol`,
- * account-specific Copilot names) are absent from the LiteLLM table, so without
+ * account-specific gateway names) are absent from the LiteLLM table, so without
  * the reported cost every Pi bucket would report as unpriced.
  */
 export function parsePiLine(line: string, state: PiScanState): UsageRecord | null {
