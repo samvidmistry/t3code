@@ -1111,6 +1111,44 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["task-progress", "task-complete"]);
   });
 
+  it("keeps Pi bg jobs in the work log instead of hiding them behind an Agents CTA", () => {
+    const identity = {
+      taskId: "pi-bg:session:1",
+      taskType: "shell",
+      agentKind: "background",
+      title: "Review changes",
+      toolUseId: "bg-launch",
+    };
+    const started = makeActivity({ id: "bg-start", kind: "task.started", payload: identity });
+    const running = makeActivity({
+      id: "bg-progress",
+      kind: "task.progress",
+      payload: {
+        ...identity,
+        status: "running",
+        summary: "Background job #1 running: Review changes",
+      },
+    });
+    const completed = makeActivity({
+      id: "bg-completed",
+      kind: "task.completed",
+      payload: {
+        ...identity,
+        status: "completed",
+        summary: "Background job #1 completed: Review changes",
+      },
+    });
+    const live = deriveWorkLogEntries([started, running]);
+    expect(live).toHaveLength(1);
+    expect(live[0]?.label).toBe("Background job #1 running: Review changes");
+    expect(live[0]?.agentSpawn).toBeUndefined();
+    const settled = deriveWorkLogEntries([started, running, completed]);
+    expect(
+      settled.some((entry) => entry.label === "Background job #1 completed: Review changes"),
+    ).toBe(true);
+    expect(settled.every((entry) => entry.agentSpawn === undefined)).toBe(true);
+  });
+
   it("uses payload summary as label for task entries when available", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

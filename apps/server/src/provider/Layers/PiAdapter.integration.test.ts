@@ -14,11 +14,13 @@ import {
   ApprovalRequestId,
   PiSettings,
   ProviderDriverKind,
-  type ProviderRuntimeEvent,
+  ProviderRuntimeEvent,
   ThreadId,
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import { make as makeBackgroundLiveness } from "../../orchestration/ThreadBackgroundLiveness.ts";
+import { runtimeEventToActivities } from "../../orchestration/Layers/ProviderRuntimeIngestion.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
 import type {
@@ -32,6 +34,7 @@ import type {
 } from "./PiRpcClient.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
+const decodeRuntimeEvent = Schema.decodeUnknownEffect(ProviderRuntimeEvent);
 const PI = ProviderDriverKind.make("pi");
 
 const HarnessLayer = ServerConfig.layerTest(process.cwd(), {
@@ -45,6 +48,7 @@ interface FakePiTransport {
   readonly pushEvent: (event: AgentSessionEvent) => Effect.Effect<void>;
   readonly pushExtensionUI: (request: RpcExtensionUIRequest) => Effect.Effect<void>;
   readonly setResponse: (commandType: string, response: RpcResponse) => void;
+  readonly wasKilled: () => boolean;
 }
 
 const asResponse = (value: unknown): RpcResponse => value as RpcResponse;
@@ -54,6 +58,7 @@ const makeFakePiRpcTransport = Effect.gen(function* () {
   const commands: Array<RpcCommand> = [];
   const extensionResponses: Array<RpcExtensionUIResponse> = [];
   const responses = new Map<string, RpcResponse>();
+  let killed = false;
   responses.set(
     "get_state",
     asResponse({
@@ -90,11 +95,14 @@ const makeFakePiRpcTransport = Effect.gen(function* () {
       }),
     request: (command) => Effect.succeed(responses.get((command as { type: string }).type)),
     messages,
-    kill: Effect.void,
+    kill: Effect.sync(() => {
+      killed = true;
+    }),
   };
 
   return {
     transport,
+    wasKilled: () => killed,
     commands,
     extensionResponses,
     pushEvent: (event) => Queue.offer(messages, { _tag: "event", event }).pipe(Effect.asVoid),
@@ -134,7 +142,352 @@ const collectEvents = (
 const enabledSettings = (overrides: Record<string, unknown> = {}) =>
   decodePiSettings({ enabled: true, ...overrides });
 
+const bgToolEnd = (toolName: string, details: unknown, toolCallId = "bg-launch") =>
+  ({
+    type: "tool_execution_end",
+    toolName,
+    toolCallId,
+    result: { content: [], details },
+    isError: false,
+  }) as AgentSessionEvent;
+
+const bgResult = (status = "done", jobId = 1) =>
+  ({
+    type: "message_end",
+    message: {
+      role: "custom",
+      customType: "bg-result",
+      content: "Background output",
+      display: true,
+      timestamp: 0,
+      details: {
+        jobId,
+        command: "claude --print review",
+        description: "Review changes",
+        status,
+        durationMs: 100,
+        stdout: "large output",
+      },
+    },
+  }) as AgentSessionEvent;
+
 it.layer(HarnessLayer)("PiAdapter integration", (it) => {
+  it.effect("keeps bg live after the turn and settles from an idle custom completion", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-bg-idle");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "task.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "start background review", attachments: [] });
+      yield* fake.pushEvent(
+        bgToolEnd("bg", {
+          jobId: 1,
+          command: "claude --print review",
+          description: "Review changes",
+        }),
+      );
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* fake.pushEvent(bgResult());
+      yield* Fiber.join(collected.fiber);
+      const events = yield* Ref.get(collected.store);
+      const tasks = events.filter((event) => event.type.startsWith("task."));
+      expect(tasks.map((event) => event.type)).toEqual([
+        "task.started",
+        "task.progress",
+        "task.completed",
+      ]);
+      const start = events.find((event) => event.type === "task.started")!;
+      const end = events.find((event) => event.type === "task.completed")!;
+      expect(end.turnId).toBe(start.turnId);
+      expect(end.payload).toMatchObject({
+        taskId: start.payload.taskId,
+        taskType: "shell",
+        title: "Review changes",
+        status: "completed",
+        toolUseId: "bg-launch",
+        usage: { durationMs: 100 },
+      });
+      expect(events.indexOf(end)).toBeGreaterThan(
+        events.findIndex((event) => event.type === "turn.completed"),
+      );
+      const liveness = makeBackgroundLiveness();
+      for (const event of events) {
+        yield* decodeRuntimeEvent(event);
+        if (
+          event.type === "task.started" ||
+          event.type === "task.progress" ||
+          event.type === "task.completed"
+        ) {
+          expect(event.raw).toBeUndefined();
+          expect(runtimeEventToActivities(event)[0]?.payload).toMatchObject({
+            agentKind: "background",
+            taskType: "shell",
+            title: "Review changes",
+          });
+          liveness.recordTaskLiveness({
+            threadId,
+            taskId: event.payload.taskId,
+            taskType: event.payload.taskType,
+            status: "status" in event.payload ? event.payload.status : undefined,
+            kind:
+              event.type === "task.started"
+                ? "started"
+                : event.type === "task.progress"
+                  ? "progress"
+                  : "completed",
+          });
+        }
+        if (event.type === "turn.completed")
+          expect(liveness.getThreadBackgroundLiveness(threadId)).toBe("monitoring");
+      }
+      expect(liveness.getThreadBackgroundLiveness(threadId)).toBeNull();
+    }),
+  );
+
+  it.effect("reconciles bg_status without resurrecting settled or historical jobs", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-bg-status");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "check jobs", attachments: [] });
+      const job = { id: 1, command: "tests", description: "Run tests" };
+      yield* fake.pushEvent(
+        bgToolEnd("bg_status", {
+          jobs: [{ ...job, status: "running" }, { ...job, id: 8, status: "done" }, null],
+        }),
+      );
+      yield* fake.pushEvent(bgToolEnd("bg_status", { jobs: [{ ...job, status: "running" }] }));
+      yield* fake.pushEvent(bgToolEnd("bg_status", { jobs: [{ ...job, status: "killed" }] }));
+      yield* fake.pushEvent(bgResult("killed"));
+      yield* fake.pushEvent(bgToolEnd("bg_status", { jobs: [{ ...job, status: "running" }] }));
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(collected.fiber);
+      const events = yield* Ref.get(collected.store);
+      expect(events.filter((event) => event.type === "task.started")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "task.progress")).toHaveLength(1);
+      const completions = events.filter((event) => event.type === "task.completed");
+      expect(completions).toHaveLength(1);
+      expect(completions[0]?.payload).toMatchObject({
+        status: "stopped",
+        title: "Run tests",
+        taskType: "shell",
+      });
+    }),
+  );
+
+  it.effect.each(["running", "launching"] as const)(
+    "stops the owning Pi process for %s bg jobs, keeping its resume cursor",
+    (state) =>
+      Effect.gen(function* () {
+        const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+        const threadId = ThreadId.make("pi-bg-stop");
+        const ready = yield* Deferred.make<void>();
+        const store = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+        const fiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil((event) => event.type === "session.exited"),
+          Stream.runForEach((event) =>
+            Ref.update(store, (events) => [...events, event]).pipe(
+              Effect.andThen(
+                event.type === (state === "launching" ? "item.started" : "turn.completed")
+                  ? Deferred.succeed(ready, undefined)
+                  : Effect.void,
+              ),
+            ),
+          ),
+          Effect.forkChild,
+        );
+        const session = yield* adapter.startSession({
+          threadId,
+          provider: PI,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({ threadId, input: "run jobs", attachments: [] });
+        yield* fake.pushEvent({
+          type: "tool_execution_start",
+          toolName: "bg",
+          toolCallId: "bg-launch",
+          args: { command: "tests" },
+        });
+        if (state === "running") {
+          yield* fake.pushEvent(
+            bgToolEnd("bg", { jobId: 1, command: "tests", description: "Run tests" }),
+          );
+          yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+        }
+        yield* Deferred.await(ready);
+        expect(fake.wasKilled()).toBe(false);
+        yield* adapter.interruptTurn(threadId);
+        yield* Fiber.join(fiber);
+        expect(fake.wasKilled()).toBe(true);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+        expect(session.resumeCursor).toEqual({ sessionFile: "/tmp/pi-session.json" });
+        const events = yield* Ref.get(store);
+        expect(
+          events
+            .filter((event) => event.type === "task.completed")
+            .map((event) => event.payload.status),
+        ).toEqual(state === "running" ? ["stopped"] : []);
+        expect(fake.commands.some((command) => command.type === "abort")).toBe(false);
+      }),
+  );
+
+  it.effect("retains the launching turn when bg finishes during a later turn", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-bg-later-turn");
+      const first = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "run tests", attachments: [] });
+      yield* fake.pushEvent(
+        bgToolEnd("bg", { jobId: 1, command: "tests", description: "Run tests" }),
+      );
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(first.fiber);
+      const start = (yield* Ref.get(first.store)).find((event) => event.type === "task.started")!;
+      const second = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.sendTurn({ threadId, input: "continue working", attachments: [] });
+      yield* fake.pushEvent(bgResult());
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(second.fiber);
+      const events = yield* Ref.get(second.store);
+      const completion = events.find((event) => event.type === "task.completed")!;
+      expect(completion.payload.taskId).toBe(start.payload.taskId);
+      expect(completion.turnId).toBe(start.turnId);
+      expect(completion.turnId).not.toBe(
+        events.find((event) => event.type === "turn.completed")?.turnId,
+      );
+    }),
+  );
+
+  it.effect("settles jobs on rollback and gives reused extension IDs new task identities", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-bg-rollback");
+      const first = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "run tests", attachments: [] });
+      const launch = bgToolEnd("bg", { jobId: 1, command: "tests", description: "Run tests" });
+      yield* fake.pushEvent(launch);
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(first.fiber);
+      const start = (yield* Ref.get(first.store)).find((event) => event.type === "task.started")!;
+      fake.setResponse(
+        "get_fork_messages",
+        asResponse({
+          type: "response",
+          command: "get_fork_messages",
+          success: true,
+          data: { messages: [{ entryId: "user-1", text: "run tests" }] },
+        }),
+      );
+      fake.setResponse(
+        "new_session",
+        asResponse({
+          type: "response",
+          command: "new_session",
+          success: true,
+          data: { cancelled: false },
+        }),
+      );
+      const second = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.rollbackThread(threadId, 1);
+      yield* adapter.sendTurn({ threadId, input: "new job", attachments: [] });
+      yield* fake.pushEvent(launch);
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(second.fiber);
+      const events = yield* Ref.get(second.store);
+      expect(events.find((event) => event.type === "task.completed")?.payload).toMatchObject({
+        taskId: start.payload.taskId,
+        status: "stopped",
+      });
+      const restarted = events.find((event) => event.type === "task.started")!;
+      expect(restarted.payload.taskId).not.toBe(start.payload.taskId);
+    }),
+  );
+
+  it.effect("handles completion racing ahead of the launch result without restarting the job", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-bg-race");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "run quick job", attachments: [] });
+      yield* fake.pushEvent(bgResult("failed"));
+      yield* fake.pushEvent(
+        bgToolEnd("bg", { jobId: 1, command: "tests", description: "Run tests" }),
+      );
+      yield* fake.pushEvent(bgResult("failed"));
+      yield* fake.pushEvent({ type: "agent_end", messages: [], willRetry: false });
+      yield* Fiber.join(collected.fiber);
+      const events = yield* Ref.get(collected.store);
+      expect(events.filter((event) => event.type === "task.started")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "task.progress")).toHaveLength(0);
+      expect(
+        events
+          .filter((event) => event.type === "task.completed")
+          .map((event) => event.payload.status),
+      ).toEqual(["failed"]);
+      yield* adapter.interruptTurn(threadId);
+      expect(fake.wasKilled()).toBe(false);
+      expect(fake.commands.at(-1)?.type).toBe("abort");
+    }),
+  );
   it.effect(
     "streams progress for same-length text, tool call, tool result, and usage-only changes",
     () =>

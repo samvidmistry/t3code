@@ -102,6 +102,17 @@ tool approval is required but the approval gate cannot be loaded. It defaults to
 Neither mode ever runs mutating tools without a gate. This field is not shown in the normal
 Settings form; leave it at `fail` unless you have a specific reason to change it.
 
+## Background Jobs
+
+If your Pi setup includes the `bg` / `bg_status` extension, T3 Code tracks its jobs
+as background work, including commands that launch another agent. They do not appear
+as native subagents in the Agents panel. Jobs stay active after Pi finishes replying;
+completion notifications or `bg_status` results update their status.
+
+**Stop** ends the Pi process when background jobs are active so the extension can stop
+its jobs too. Your next message resumes the saved conversation. To stop just one job,
+ask Pi to use `bg_status` with `action: "kill"` and its job ID.
+
 ## Limitations
 
 - **Early Access.** Expect rough edges.

@@ -48,6 +48,11 @@ import {
 } from "../Errors.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import {
+  piBackgroundCompletion,
+  piBackgroundToolJobs,
+  type PiBackgroundJob,
+} from "./PiBackgroundTasks.ts";
+import {
   normalizePiSubagentResult,
   subagentChildCompletionSummary,
   subagentChildFingerprint,
@@ -145,6 +150,14 @@ interface SubagentChildTaskState {
   progressFingerprint: string | undefined;
 }
 
+interface BackgroundTaskState {
+  readonly taskId: RuntimeTaskId;
+  readonly title: string;
+  readonly turnId: TurnId | undefined;
+  readonly toolUseId: string | undefined;
+  completed: boolean;
+}
+
 interface PiTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
@@ -185,6 +198,9 @@ interface PiSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<PiToolItem> }>;
   // parent `subagent` toolCallId -> child index -> child task state
   readonly subagentTasks: Map<string, Map<number, SubagentChildTaskState>>;
+  // bg jobs outlive turns; retain settled identities to dedupe bg_status snapshots.
+  readonly backgroundTasks: Map<number, BackgroundTaskState>;
+  readonly backgroundLaunches: Set<string>;
   // `think` toolCallIds routed to reasoning; their update/end events emit no tool row
   readonly thinkItemIds: Set<string>;
   stopped: boolean;
@@ -193,6 +209,13 @@ interface PiSessionContext {
   currentContextWindow: number | undefined;
   compactsAutomatically: boolean | undefined;
   appliedThinkingLevel: PiThinkingLevel | undefined;
+}
+
+function hasBackgroundWork(context: PiSessionContext): boolean {
+  return (
+    context.backgroundLaunches.size > 0 ||
+    [...context.backgroundTasks.values()].some((task) => !task.completed)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +695,95 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       context.subagentTasks.clear();
     });
 
+  const emitBackgroundTask = Effect.fn("PiAdapter.emitBackgroundTask")(function* (
+    context: PiSessionContext,
+    job: PiBackgroundJob,
+    toolUseId?: string,
+    fromStatusSnapshot = false,
+  ) {
+    let task = context.backgroundTasks.get(job.jobId);
+    // bg_status can include completed jobs restored from an older Pi process.
+    if (!task && fromStatusSnapshot && job.status !== "running") return;
+    if (!task) {
+      task = {
+        taskId: RuntimeTaskId.make(`pi-bg:${yield* nextUuid}:${job.jobId}`),
+        title: job.title,
+        turnId: context.turnState?.turnId,
+        toolUseId,
+        completed: false,
+      };
+      context.backgroundTasks.set(job.jobId, task);
+      const stamp = yield* makeEventStamp();
+      yield* offerRuntimeEvent({
+        ...stamp,
+        provider: PROVIDER,
+        providerInstanceId: boundInstanceId,
+        threadId: context.session.threadId,
+        ...(task.turnId ? { turnId: task.turnId } : {}),
+        type: "task.started",
+        payload: {
+          taskId: task.taskId,
+          taskType: "shell",
+          title: task.title,
+          description: task.title,
+          ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+        },
+      });
+      if (job.status === "running") {
+        const progressStamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          ...progressStamp,
+          provider: PROVIDER,
+          providerInstanceId: boundInstanceId,
+          threadId: context.session.threadId,
+          ...(task.turnId ? { turnId: task.turnId } : {}),
+          type: "task.progress",
+          payload: {
+            taskId: task.taskId,
+            taskType: "shell",
+            title: task.title,
+            description: task.title,
+            summary: `Background job #${job.jobId} running: ${task.title}`,
+            status: "running",
+            ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+          },
+        });
+      }
+    }
+    if (task.completed || job.status === "running") return;
+    task.completed = true;
+    const stamp = yield* makeEventStamp();
+    // Do not persist raw custom messages/snapshots: they contain cumulative output.
+    yield* offerRuntimeEvent({
+      ...stamp,
+      provider: PROVIDER,
+      providerInstanceId: boundInstanceId,
+      threadId: context.session.threadId,
+      ...(task.turnId ? { turnId: task.turnId } : {}),
+      type: "task.completed",
+      payload: {
+        taskId: task.taskId,
+        taskType: "shell",
+        title: task.title,
+        status: job.status,
+        summary: `Background job #${job.jobId} ${job.status}: ${task.title}`,
+        ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+        ...(job.durationMs !== undefined ? { usage: { durationMs: job.durationMs } } : {}),
+      },
+    });
+  });
+
+  const finalizeBackgroundTasks = Effect.fn("PiAdapter.finalizeBackgroundTasks")(function* (
+    context: PiSessionContext,
+    status: "stopped" | "failed",
+  ) {
+    for (const [jobId, task] of context.backgroundTasks) {
+      if (!task.completed) yield* emitBackgroundTask(context, { jobId, title: task.title, status });
+    }
+    context.backgroundTasks.clear();
+    context.backgroundLaunches.clear();
+  });
+
   const completeTurn = (
     context: PiSessionContext,
     state: "completed" | "failed" | "interrupted" | "cancelled",
@@ -799,6 +911,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         }
 
         case "message_end": {
+          const job = piBackgroundCompletion(event.message);
+          if (job) {
+            yield* emitBackgroundTask(context, job);
+            return;
+          }
           const turnState = context.turnState;
           if (!turnState || event.message.role !== "assistant") return;
 
@@ -824,6 +941,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
         case "tool_execution_start": {
           if (!context.turnState) return;
+          if (event.toolName === "bg") context.backgroundLaunches.add(event.toolCallId);
           const itemId = RuntimeItemId.make(event.toolCallId);
 
           // `think` renders as reasoning, not a tool row. The whole payload
@@ -909,6 +1027,15 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         }
 
         case "tool_execution_end": {
+          context.backgroundLaunches.delete(event.toolCallId);
+          for (const job of piBackgroundToolJobs(event.toolName, event.result, event.isError)) {
+            yield* emitBackgroundTask(
+              context,
+              job,
+              event.toolName === "bg" ? event.toolCallId : undefined,
+              event.toolName === "bg_status",
+            );
+          }
           if (!context.turnState) return;
           // Already rendered as reasoning at start; `think` has no output to settle.
           if (context.thinkItemIds.delete(event.toolCallId)) return;
@@ -1208,7 +1335,13 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
       if (context.notificationFiber) yield* Fiber.interrupt(context.notificationFiber);
 
+      // Pi's graceful process shutdown runs extension cleanup, including bg's
+      // detached process groups. An RPC abort alone only stops the LLM turn.
+      if (hasBackgroundWork(context)) {
+        yield* context.transport.kill;
+      }
       yield* Effect.ignore(Scope.close(context.sessionScope, Exit.void));
+      yield* finalizeBackgroundTasks(context, opts?.exitKind === "error" ? "failed" : "stopped");
 
       const updatedAt = yield* nowIso;
       const { activeTurnId: _activeTurnId, ...closedSession } = context.session;
@@ -1442,6 +1575,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       turnState: undefined,
       turns: [],
       subagentTasks: new Map(),
+      backgroundTasks: new Map(),
+      backgroundLaunches: new Set(),
       thinkItemIds: new Set(),
       stopped: false,
       currentModel: modelSelection?.model,
@@ -1624,6 +1759,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const interruptTurn: PiAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
     function* (threadId) {
       const context = yield* requireSession(threadId);
+      if (hasBackgroundWork(context)) {
+        // Stop-everything must stop the process owning bg, not just its current
+        // turn. The persisted resume cursor keeps the conversation resumable.
+        yield* stopSessionInternal(context, { emitExitEvent: true });
+        return;
+      }
       yield* Effect.ignore(context.transport.writeCommand({ type: "abort" }));
       // settle bridged requests so Pi isn't left blocked (matches Cursor)
       yield* cancelPendingExtensionRequests(context);
@@ -1765,6 +1906,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           detail: "Pi rejected or cancelled the rollback.",
         });
       }
+
+      // A successful Pi fork/reset shuts down the old extension runtime. Its
+      // job IDs may restart at 1, so close the old tasks before accepting new ones.
+      yield* finalizeBackgroundTasks(context, "stopped");
 
       // CRITICAL: fork/new_session rebinds to a new session file — refresh the
       // resume cursor or a later reconnect resumes the stale pre-rollback branch

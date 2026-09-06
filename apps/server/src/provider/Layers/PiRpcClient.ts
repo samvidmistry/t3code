@@ -9,6 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ModelSelection, ServerProviderModel } from "@t3tools/contracts";
 import type { ModelCapabilities } from "@t3tools/contracts";
+import type * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -31,7 +32,6 @@ export function tryParsePiJsonObject(text: string): Record<string, unknown> | nu
     return null;
   }
   try {
-    // eslint-disable-next-line no-restricted-syntax -- boundary parse of an untrusted JSONL line
     const value = JSON.parse(trimmed) as unknown; // @effect-diagnostics-ignore preferSchemaOverJson
     return value !== null && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -391,7 +391,7 @@ export const makePiRpcTransport = (options: MakePiRpcTransportOptions) =>
       }),
     );
 
-    const outgoing = yield* Queue.unbounded<Uint8Array>();
+    const outgoing = yield* Queue.unbounded<Uint8Array, Cause.Done>();
     const messages = yield* Queue.unbounded<PiStdoutMessage>();
     const pendingRequests = new Map<string, Deferred.Deferred<RpcResponse>>();
     // resolved on process exit to unblock in-flight requests (fail fast, not full timeout)
@@ -460,7 +460,13 @@ export const makePiRpcTransport = (options: MakePiRpcTransportOptions) =>
         return outcome._tag === "None" ? undefined : Option.getOrUndefined(outcome.value);
       });
 
-    const kill = child.kill().pipe(Effect.ignore);
+    const kill = Effect.gen(function* () {
+      // RPC stdin EOF invokes Pi's session_shutdown handlers on every platform.
+      // SIGTERM alone skips extension cleanup on Windows, orphaning bg jobs.
+      yield* Queue.end(outgoing);
+      const exited = yield* Deferred.await(closed).pipe(Effect.timeoutOption(5_000));
+      if (Option.isNone(exited)) yield* child.kill().pipe(Effect.ignore);
+    });
 
     return {
       writeCommand: (command) => writeLine(command),
