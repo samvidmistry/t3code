@@ -10,6 +10,7 @@
 
 import * as Migrator from "effect/unstable/sql/Migrator";
 import * as Effect from "effect/Effect";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -166,6 +167,35 @@ export interface RunMigrationsOptions {
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
+  // The Pi fork used 48 for a one-time progress cleanup. The migrator only
+  // compares numeric IDs, so those installs would silently miss upstream's 48.
+  // Repair that exact collision before running later migrations; never replay
+  // the destructive cleanup or reset the migration history.
+  if (toMigrationInclusive === undefined || toMigrationInclusive >= 48) {
+    const sql = yield* SqlClient.SqlClient;
+    const tables = yield* sql`
+      SELECT name FROM sqlite_schema
+      WHERE type = 'table' AND name = 'effect_sql_migrations'
+    `;
+    if (tables.length > 0) {
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const legacy = yield* sql`
+          SELECT migration_id FROM effect_sql_migrations
+          WHERE migration_id = 48 AND name = 'PruneTransientTaskProgress'
+        `;
+          if (legacy.length === 0) return;
+          yield* Migration0048;
+          yield* sql`
+          UPDATE effect_sql_migrations
+          SET name = 'ProjectionThreadBranchPullRequest'
+          WHERE migration_id = 48 AND name = 'PruneTransientTaskProgress'
+        `;
+          yield* Effect.logInfo("Reconciled legacy Pi migration 48 without removing user data");
+        }),
+      );
+    }
+  }
   const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
