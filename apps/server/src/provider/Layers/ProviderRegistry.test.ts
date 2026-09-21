@@ -2630,7 +2630,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "cursor",
                 "grok",
                 "opencode",
+                "pi",
               ]);
+              const piProvider = providers.find((provider) => provider.driver === "pi");
+              assert.strictEqual(piProvider?.enabled, false);
+              assert.strictEqual(piProvider?.status, "disabled");
               assert.strictEqual(cursorProvider?.enabled, false);
               assert.strictEqual(cursorProvider?.status, "disabled");
               assert.strictEqual(

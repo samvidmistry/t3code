@@ -91,6 +91,12 @@ const buildCmd = Command.make(
 
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");
+      const piAssets = path.join(serverDir, "dist/assets/pi");
+      yield* fs.makeDirectory(piAssets, { recursive: true });
+      yield* fs.copyFile(
+        path.join(serverDir, "src/provider/assets/pi/t3-approvals.ts"),
+        path.join(piAssets, "t3-approvals.ts"),
+      );
 
       if (yield* fs.exists(webDist)) {
         yield* fs.copy(webDist, clientTarget);

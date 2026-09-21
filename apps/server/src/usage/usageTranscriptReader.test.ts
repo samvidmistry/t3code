@@ -61,6 +61,45 @@ function codexUsageLine(outputTokens: number, secondsOffset: number): string {
 }
 
 describe("readTranscriptRecords resume", () => {
+  it("resumes Pi files with the original session ID, including an unterminated tail", async () => {
+    const path = NodePath.join(dir, "pi.jsonl");
+    const line = (id: number) =>
+      JSON.stringify({
+        type: "message",
+        id: `entry-${id}`,
+        timestamp: "2026-08-01T10:00:00Z",
+        message: {
+          role: "assistant",
+          model: "gpt-5.6-sol",
+          usage: { input: 10, output: id, cost: { total: 0.1 } },
+        },
+      });
+    await NodeFSP.writeFile(
+      path,
+      JSON.stringify({ type: "session", id: "pi-session" }) + "\n" + line(1) + "\n" + line(2),
+    );
+    const first = await readTranscriptRecords(path, "pi");
+    assert.isNotNull(first);
+    assert.equal(first.records.length, 1);
+    assert.equal(first.tailRecords.length, 1);
+    await NodeFSP.appendFile(path, "\n" + line(3) + "\n");
+    const second = await readTranscriptRecords(path, "pi", first.position);
+    assert.isNotNull(second);
+    assert.isTrue(second.resumed);
+    assert.deepStrictEqual(
+      second.records.map((record) => [record.sessionId, record.totals.outputTokens]),
+      [
+        ["pi-session", 2],
+        ["pi-session", 3],
+      ],
+    );
+    const { piState: _piState, ...legacyPosition } = first.position;
+    const legacy = await readTranscriptRecords(path, "pi", legacyPosition);
+    assert.isNotNull(legacy);
+    assert.isFalse(legacy.resumed);
+    assert.equal(legacy.records.length, 3);
+  });
+
   it("parses only appended lines when resuming a grown file", async () => {
     const path = NodePath.join(dir, "claude.jsonl");
     await NodeFSP.writeFile(path, claudeLine(1, 5) + claudeLine(2, 7));

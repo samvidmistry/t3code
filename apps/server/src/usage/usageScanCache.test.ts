@@ -55,6 +55,52 @@ function cacheWith(entries: readonly [string, number, readonly UsageRecord[]][])
 }
 
 describe("scan cache round trip", () => {
+  it("preserves upstream v3 and Pi-fork v4 cached history after transcripts are gone", () => {
+    const original: ScanCache = new Map([
+      [
+        "/removed/pi.jsonl",
+        {
+          provider: "pi",
+          size: 400,
+          mtimeMs: 123,
+          records: [record({ provider: "pi", reportedCostUsd: 0.25 })],
+          tailRecords: [],
+          position: position(),
+        },
+      ],
+    ]);
+    for (const version of [3, 4]) {
+      const serialized = { ...encodeScanCache(original), version };
+      expect(decodeScanCache(serialized)).toEqual(original);
+    }
+  });
+
+  it("round trips Pi incremental state and rejects corrupt state", () => {
+    const original: ScanCache = new Map([
+      [
+        "/pi.jsonl",
+        {
+          provider: "pi",
+          size: 400,
+          mtimeMs: 123,
+          records: [record({ provider: "pi" })],
+          tailRecords: [],
+          position: position({ piState: { sessionId: "pi-original" } }),
+        },
+      ],
+    ]);
+    const encoded = encodeScanCache(original);
+    expect(decodeScanCache(encoded)).toEqual(original);
+    expect(
+      decodeScanCache({
+        ...encoded,
+        files: {
+          "/pi.jsonl": { ...encoded.files["/pi.jsonl"], ps: { sessionId: 123 } },
+        },
+      }).size,
+    ).toBe(0);
+  });
+
   it("restores records unchanged", () => {
     const original = cacheWith([
       ["/a.jsonl", 100, [record(), record({ dedupeKey: "msg_2:", model: "claude-opus-5" })]],

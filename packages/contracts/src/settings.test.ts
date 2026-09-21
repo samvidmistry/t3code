@@ -20,6 +20,31 @@ const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
+describe("Pi settings", () => {
+  it("keeps Pi opt-in without dropping existing fork configuration", () => {
+    expect(decodeServerSettings({}).providers.pi.enabled).toBe(false);
+    const settings = decodeServerSettings({
+      providers: { pi: { enabled: true, binaryPath: "/opt/pi", customModels: ["company/model"] } },
+      providerInstances: {
+        pi_work: {
+          driver: "pi",
+          enabled: true,
+          displayName: "Work Pi",
+          environment: [{ name: "PI_CODING_AGENT_DIR", value: "/work/pi", sensitive: false }],
+          config: { binaryPath: "/work/bin/pi", customModels: ["company/model"] },
+        },
+      },
+    });
+    const restored = decodeServerSettings(encodeServerSettings(settings));
+    expect(restored.providers.pi).toEqual(settings.providers.pi);
+    expect(restored.providerInstances).toEqual(settings.providerInstances);
+    expect(restored.providers.pi.binaryPath).toBe("/opt/pi");
+    expect(
+      decodeServerSettingsPatch({ providers: { pi: { enabled: false, binaryPath: "pi" } } }),
+    ).toEqual({ providers: { pi: { enabled: false, binaryPath: "pi" } } });
+  });
+});
+
 describe("storage cleanup settings", () => {
   it("keeps cleanup disabled for existing installations", () => {
     expect(decodeServerSettings({}).worktreeCleanup).toBeNull();

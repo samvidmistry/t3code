@@ -3,9 +3,11 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   GROK_COST_USD_TICKS_PER_DOLLAR,
   initialCodexScanState,
+  initialPiScanState,
   parseClaudeLine,
   parseCodexLine,
   parseGrokLine,
+  parsePiLine,
   totalTokens,
 } from "./usageTranscripts.ts";
 
@@ -562,5 +564,158 @@ describe("parseGrokLine", () => {
 
     const records = parseGrokLine(line);
     expect(records[0]?.timestampMs).toBe(1_786_372_566_000);
+  });
+});
+
+describe("parsePiLine", () => {
+  const sessionLine = JSON.stringify({
+    type: "session",
+    version: 3,
+    id: "019fd5fa-90fa-7240-85d0-502489febf37",
+    timestamp: "2026-08-06T07:29:55.962Z",
+    cwd: "/home/theo/project",
+  });
+
+  /** Shaped after a real Pi assistant record. */
+  function piLine(overrides: {
+    responseId?: string | null;
+    model?: string;
+    usage?: Record<string, unknown>;
+  }): string {
+    return JSON.stringify({
+      type: "message",
+      id: "65c282c4",
+      parentId: "8cfd18d1",
+      timestamp: "2026-08-06T07:30:05.561Z",
+      message: {
+        role: "assistant",
+        api: "copilot-websocket",
+        provider: "github-copilot-websocket",
+        model: overrides.model ?? "gpt-5.6-sol",
+        content: [{ type: "text", text: "hello" }],
+        usage: overrides.usage ?? {
+          input: 3,
+          output: 216,
+          cacheRead: 0,
+          cacheWrite: 10393,
+          reasoning: 62,
+          totalTokens: 10612,
+          cost: {
+            input: 0.000015,
+            output: 0.00648,
+            cacheRead: 0,
+            cacheWrite: 0.06496,
+            total: 0.07145,
+          },
+        },
+        stopReason: "toolUse",
+        timestamp: 1786001397751,
+        ...(overrides.responseId === null ? {} : { responseId: overrides.responseId ?? "resp_1" }),
+      },
+    });
+  }
+
+  it("extracts token totals, the reported cost and the session id", () => {
+    const state = initialPiScanState();
+    expect(parsePiLine(sessionLine, state)).toBeNull();
+    const record = parsePiLine(piLine({}), state);
+
+    expect(record).not.toBeNull();
+    expect(record?.provider).toBe("pi");
+    expect(record?.model).toBe("gpt-5.6-sol");
+    expect(record?.sessionId).toBe("019fd5fa-90fa-7240-85d0-502489febf37");
+    expect(record?.totals).toEqual({
+      uncachedInputTokens: 3,
+      cachedInputTokens: 0,
+      cacheCreationTokens: 10393,
+      outputTokens: 216,
+      reasoningTokens: 62,
+    });
+    // Pi's own totalTokens is the sum of the four non-reasoning figures, which
+    // is what our own total has to reproduce.
+    expect(totalTokens(record!.totals)).toBe(10612);
+    expect(record?.reportedCostUsd).toBe(0.07145);
+    expect(record?.dedupeKey).toBe("resp_1");
+  });
+
+  it("identifies fork-copied messages even without a provider response ID", () => {
+    const first = initialPiScanState();
+    const fork = initialPiScanState();
+    parsePiLine(sessionLine, first);
+    parsePiLine(JSON.stringify({ type: "session", id: "fork-session" }), fork);
+    const sourceRecord = parsePiLine(piLine({ responseId: null }), first);
+    const copiedRecord = parsePiLine(piLine({ responseId: null }), fork);
+    expect(sourceRecord?.dedupeKey).toBeTruthy();
+    expect(copiedRecord?.dedupeKey).toBe(sourceRecord?.dedupeKey);
+    expect(copiedRecord?.sessionId).not.toBe(sourceRecord?.sessionId);
+  });
+
+  it("bills extended-TTL cache writes as cache creation", () => {
+    const record = parsePiLine(
+      piLine({
+        usage: { input: 1, output: 2, cacheRead: 5, cacheWrite: 7, cacheWrite1h: 11 },
+      }),
+      initialPiScanState(),
+    );
+
+    expect(record?.totals.cacheCreationTokens).toBe(18);
+  });
+
+  it("caps reasoning at output, since it is reported inside it", () => {
+    const record = parsePiLine(
+      piLine({ usage: { input: 1, output: 5, reasoning: 900 } }),
+      initialPiScanState(),
+    );
+
+    expect(record?.totals.reasoningTokens).toBe(5);
+  });
+
+  it("drops aborted and errored turns, which carry an all-zero usage block", () => {
+    // These also arrive without a responseId, so they would otherwise land as
+    // undeduplicable zero-token records and dilute the cost-quality shares.
+    expect(
+      parsePiLine(
+        piLine({
+          responseId: null,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { total: 0 },
+          },
+        }),
+        initialPiScanState(),
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores lines that are not assistant messages", () => {
+    const state = initialPiScanState();
+    expect(
+      parsePiLine(
+        JSON.stringify({ type: "message", message: { role: "user", content: [] } }),
+        state,
+      ),
+    ).toBeNull();
+    expect(
+      parsePiLine(JSON.stringify({ type: "model_change", model: "grok-4.5" }), state),
+    ).toBeNull();
+    expect(parsePiLine("not json", state)).toBeNull();
+  });
+});
+
+describe("totalTokens", () => {
+  it("does not add reasoning on top of output", () => {
+    expect(
+      totalTokens({
+        uncachedInputTokens: 10,
+        cachedInputTokens: 20,
+        cacheCreationTokens: 30,
+        outputTokens: 40,
+        reasoningTokens: 25,
+      }),
+    ).toBe(100);
   });
 });

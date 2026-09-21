@@ -102,6 +102,7 @@ const serviceLayers = (input: {
     Layer.provideMerge(
       Layer.succeed(HostProcessEnvironment, {
         GROK_HOME: NodePath.join(input.home, "grok"),
+        PI_CODING_AGENT_DIR: NodePath.join(input.home, "pi"),
         ...input.environment,
       }),
     ),
@@ -112,6 +113,68 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 }
 
 describe("UsageService", () => {
+  it.live(
+    "scans Pi account and session-directory overrides without counting shared roots twice",
+    () =>
+      Effect.gen(function* () {
+        const { home, settings } = yield* setup;
+        const sessionDir = NodePath.join(home, "pi-sessions");
+        yield* Effect.promise(async () => {
+          await NodeFSP.mkdir(sessionDir);
+          await NodeFSP.writeFile(
+            NodePath.join(sessionDir, "session.jsonl"),
+            [
+              { type: "session", id: "pi-account" },
+              {
+                type: "message",
+                id: "pi-response",
+                timestamp: "2026-08-01T10:00:00Z",
+                message: {
+                  role: "assistant",
+                  model: "gpt-5.6-sol",
+                  usage: { input: 10, output: 21, cost: { total: 0.25 } },
+                },
+              },
+            ]
+              .map((line) => encodeUnknownJsonString(line))
+              .join("\n") + "\n",
+          );
+        });
+        const environment = [
+          { name: "PI_CODING_AGENT_SESSION_DIR", value: sessionDir, sensitive: false },
+        ];
+        const layers = serviceLayers({
+          prefix: "pi-usage-test-",
+          home,
+          settings: {
+            ...settings,
+            providerInstances: {
+              [ProviderInstanceId.make("pi")]: {
+                driver: ProviderDriverKind.make("pi"),
+                enabled: false,
+                environment,
+              },
+              [ProviderInstanceId.make("pi_work")]: {
+                driver: ProviderDriverKind.make("pi"),
+                enabled: true,
+                environment,
+              },
+            },
+          },
+        });
+        const summary = yield* Effect.gen(function* () {
+          const service = yield* UsageService.UsageService;
+          return yield* service.readSummary(WINDOW);
+        }).pipe(Effect.provide(UsageService.layer.pipe(Layer.provide(layers))));
+        const piBuckets = summary.buckets.filter((bucket) => bucket.provider === "pi");
+        assert.equal(totalOutputTokens({ buckets: piBuckets }), 21);
+        assert.equal(
+          piBuckets.reduce((sum, bucket) => sum + bucket.costUsd, 0),
+          0.25,
+        );
+      }).pipe(Effect.scoped),
+  );
+
   it.live("reads configured and disabled accounts once across shared and aliased homes", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
