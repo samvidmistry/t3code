@@ -221,6 +221,33 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
     }),
   );
 
+  it.effect(
+    "keeps file and pasted-text attachments as paths instead of sending them as images",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+        const threadId = ThreadId.make("pi-file-attachment");
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        const input =
+          '[Pasted text "prompt.txt" is saved at: /tmp/prompt.txt. Inspect it as needed.]';
+        yield* adapter.sendTurn({
+          threadId,
+          input,
+          attachments: [
+            {
+              type: "file",
+              id: "file-attachment",
+              name: "prompt.txt",
+              mimeType: "text/plain",
+              sizeBytes: 12,
+              source: { _tag: "pasted-text" },
+            },
+          ],
+        });
+        expect(fake.commands).toEqual([{ type: "prompt", message: input }]);
+      }),
+  );
+
   it.effect("settles an extension command that does not start an agent run", () =>
     Effect.gen(function* () {
       const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());

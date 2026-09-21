@@ -1428,32 +1428,36 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const resolvePromptImages = (
     attachments: ProviderSendTurnInput["attachments"],
   ): Effect.Effect<ReadonlyArray<PiImageContent>, ProviderAdapterError> =>
-    Effect.forEach(attachments ?? [], (attachment) =>
-      Effect.gen(function* () {
-        const attachmentPath = resolveAttachmentPath({
-          attachmentsDir: serverConfig.attachmentsDir,
-          attachment,
-        });
-        if (!attachmentPath) {
-          return yield* new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "prompt",
-            detail: `Invalid attachment id '${attachment.id}'.`,
+    // ProviderService already adds on-disk references for files and folded pastes.
+    // Only images belong in Pi's native image-content payload.
+    Effect.forEach(
+      (attachments ?? []).filter((attachment) => attachment.type === "image"),
+      (attachment) =>
+        Effect.gen(function* () {
+          const attachmentPath = resolveAttachmentPath({
+            attachmentsDir: serverConfig.attachmentsDir,
+            attachment,
           });
-        }
-        const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "prompt",
-                detail: `Failed to read attachment '${attachment.id}'.`,
-                cause,
-              }),
-          ),
-        );
-        return piImageContentFromBytes({ mimeType: attachment.mimeType, bytes });
-      }),
+          if (!attachmentPath) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "prompt",
+              detail: `Invalid attachment id '${attachment.id}'.`,
+            });
+          }
+          const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "prompt",
+                  detail: `Failed to read attachment '${attachment.id}'.`,
+                  cause,
+                }),
+            ),
+          );
+          return piImageContentFromBytes({ mimeType: attachment.mimeType, bytes });
+        }),
     );
 
   // switch only on change; fail closed (prompt not sent) on a bad slug or rejection
