@@ -17,6 +17,7 @@ function claudeLine(overrides: {
   contentType: string;
   model?: string;
   outputTokens?: number;
+  speed?: string;
 }): string {
   return JSON.stringify({
     type: "assistant",
@@ -33,6 +34,7 @@ function claudeLine(overrides: {
         cache_creation_input_tokens: 66818,
         cache_read_input_tokens: 1000,
         output_tokens: overrides.outputTokens ?? 286,
+        ...(overrides.speed === undefined ? {} : { speed: overrides.speed }),
       },
     },
   });
@@ -53,6 +55,15 @@ describe("parseClaudeLine", () => {
       reasoningTokens: 0,
     });
     expect(record?.dedupeKey).toBe("msg_1:");
+    expect(record?.fast).toBe(false);
+  });
+
+  it("marks fast-mode requests", () => {
+    const line = (speed: string) =>
+      parseClaudeLine(claudeLine({ messageId: "msg_1", contentType: "text", speed }));
+
+    expect(line("fast")?.fast).toBe(true);
+    expect(line("standard")?.fast).toBe(false);
   });
 
   it("gives every content block of one message the same dedupe key", () => {

@@ -24,6 +24,7 @@ function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
       reasoningTokens: 0,
     },
     reportedCostUsd: null,
+    fast: false,
     dedupeKey: "msg_1:",
     ...overrides,
   };
@@ -69,9 +70,32 @@ describe("scan cache round trip", () => {
         },
       ],
     ]);
+    const legacyRow = (row: unknown) => (row as unknown[]).slice(0, 10);
     for (const version of [3, 4]) {
-      const serialized = { ...encodeScanCache(original), version };
-      expect(decodeScanCache(serialized)).toEqual(original);
+      const encoded = encodeScanCache(original);
+      const serialized = {
+        ...encoded,
+        version,
+        files: Object.fromEntries(
+          Object.entries(encoded.files).map(([path, file]) => [
+            path,
+            { ...file, r: file.r.map(legacyRow), t: file.t.map(legacyRow) },
+          ]),
+        ),
+      };
+      const entry = original.get("/removed/pi.jsonl")!;
+      expect(decodeScanCache(serialized)).toEqual(
+        new Map([
+          [
+            "/removed/pi.jsonl",
+            {
+              ...entry,
+              size: -1,
+              position: { ...entry.position, resumeOffset: 0, guardLength: 0 },
+            },
+          ],
+        ]),
+      );
     }
   });
 
@@ -103,7 +127,11 @@ describe("scan cache round trip", () => {
 
   it("restores records unchanged", () => {
     const original = cacheWith([
-      ["/a.jsonl", 100, [record(), record({ dedupeKey: "msg_2:", model: "claude-opus-5" })]],
+      [
+        "/a.jsonl",
+        100,
+        [record(), record({ dedupeKey: "msg_2:", model: "claude-opus-5-5", fast: true })],
+      ],
       ["/b.jsonl", 200, [record({ sessionId: "session-b", reportedCostUsd: 1.5 })]],
     ]);
     original.set("/grok.jsonl", {
@@ -169,7 +197,18 @@ describe("scan cache round trip", () => {
     expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/a.jsonl")).toBe(false);
   });
 
-  it("rejects a document from the previous cache version", () => {
+  it("drops an entry whose fast flag is not 0 or 1", () => {
+    const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record({ fast: true })]]]));
+    const row = encoded.files["/a.jsonl"]!.r[0]!;
+    const poisoned = {
+      ...encoded,
+      files: { "/a.jsonl": { ...encoded.files["/a.jsonl"]!, r: [[...row.slice(0, 10), true]] } },
+    };
+
+    expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/a.jsonl")).toBe(false);
+  });
+
+  it("rejects a document from a pre-incremental cache version", () => {
     const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
     const previous = { ...encoded, version: 2 };
 

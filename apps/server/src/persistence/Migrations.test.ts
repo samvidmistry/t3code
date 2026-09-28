@@ -42,7 +42,7 @@ it.effect("upgrades the Pi fork without deleting history, model selections, or P
     const executed = yield* runMigrations();
     assert.deepStrictEqual(
       executed.map(([id]) => id),
-      [49, 50, 51, 52, 53],
+      [49, 50, 51, 52, 53, 54],
     );
     assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_events`, events);
     assert.deepStrictEqual(yield* sql`SELECT * FROM projection_thread_activities`, activities);

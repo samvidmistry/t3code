@@ -23,8 +23,10 @@ import type { CodexScanState, PiScanState, UsageRecord } from "./usageTranscript
 // entries would keep serving double-counted records forever.
 // v3: entries carry the parse position and reducer state so a grown file
 // re-parses only its appended bytes instead of starting over.
-// v4 was the Pi fork's non-incremental scanner. v5 adds Pi header state.
-// Keep v3/v4 entries: retained usage can outlive the source transcript.
+// v4: records carry Claude fast mode, which v3 rows never captured.
+// v5: Pi transcripts plus Pi header state (the Pi fork's own v4 is not v4-compatible).
+// Legacy v3/v4 rows may lack fast mode. They are kept so retained usage survives
+// transcript cleanup, but forced to re-parse whenever the source file still exists.
 const USAGE_SCAN_CACHE_VERSION = 5 as const;
 
 export interface CachedFile {
@@ -60,6 +62,7 @@ type SerializedRecord = readonly [
   reasoningTokens: number,
   dedupeKey: string | null,
   reportedCostUsd: number | null,
+  fast: 0 | 1,
 ];
 
 interface SerializedFile {
@@ -112,6 +115,7 @@ export function encodeScanCache(cache: ScanCache): SerializedCache {
     record.totals.reasoningTokens,
     record.dedupeKey,
     record.reportedCostUsd,
+    record.fast ? 1 : 0,
   ];
 
   const files: Record<string, SerializedFile> = {};
@@ -148,8 +152,8 @@ export function decodeScanCache(document: unknown): ScanCache {
   if (typeof document !== "object" || document === null) return cache;
 
   const root = document as Partial<SerializedCache>;
-  if (root.version !== 3 && root.version !== 4 && root.version !== USAGE_SCAN_CACHE_VERSION)
-    return cache;
+  const legacy = root.version === 3 || root.version === 4;
+  if (!legacy && root.version !== USAGE_SCAN_CACHE_VERSION) return cache;
   if (!isRecordArray(root.models) || !isRecordArray(root.sessions)) return cache;
   if (typeof root.files !== "object" || root.files === null) return cache;
 
@@ -170,7 +174,7 @@ export function decodeScanCache(document: unknown): ScanCache {
   ): UsageRecord[] | null => {
     const records: UsageRecord[] = [];
     for (const row of rows) {
-      if (!isRecordArray(row) || row.length < 10) return null;
+      if (!isRecordArray(row) || row.length < (legacy ? 10 : 11)) return null;
       const [
         timestampMs,
         modelIndex,
@@ -182,6 +186,7 @@ export function decodeScanCache(document: unknown): ScanCache {
         reasoning,
         dedupeKey,
         reportedCostUsd,
+        fast,
       ] = row as SerializedRecord;
 
       const model = typeof modelIndex === "number" ? models[modelIndex] : undefined;
@@ -193,7 +198,8 @@ export function decodeScanCache(document: unknown): ScanCache {
         !Number.isFinite(cached) ||
         !Number.isFinite(cacheCreation) ||
         !Number.isFinite(output) ||
-        !Number.isFinite(reasoning)
+        !Number.isFinite(reasoning) ||
+        (fast !== 0 && fast !== 1 && !(legacy && fast === undefined))
       ) {
         return null;
       }
@@ -211,6 +217,7 @@ export function decodeScanCache(document: unknown): ScanCache {
           reasoningTokens: reasoning,
         },
         reportedCostUsd: typeof reportedCostUsd === "number" ? reportedCostUsd : null,
+        fast: fast === 1,
         dedupeKey: typeof dedupeKey === "string" ? dedupeKey : null,
       });
     }
@@ -256,14 +263,16 @@ export function decodeScanCache(document: unknown): ScanCache {
     if (records === null || tailRecords === null) continue;
 
     cache.set(path, {
-      size: entry.s,
+      // Legacy entries never match a real stat and never resume, so a surviving
+      // transcript gets one full re-parse with fast mode captured.
+      size: legacy ? -1 : entry.s,
       mtimeMs: entry.m,
       provider,
       records,
       tailRecords,
       position: {
-        resumeOffset: entry.o,
-        guardLength: entry.gl,
+        resumeOffset: legacy ? 0 : entry.o,
+        guardLength: legacy ? 0 : entry.gl,
         guardHash: entry.gh,
         codexState,
         ...(entry.ps ? { piState: { sessionId: entry.ps.sessionId } } : {}),
