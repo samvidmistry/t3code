@@ -23,7 +23,9 @@ Pi has no native permission gate. T3 Code supplies one for permission modes that
 
 Recognized `subagent` extension results appear as agent activity. Jobs from `bg` / `bg_status` are background shell work, not native subagents. They remain active after Pi finishes replying and update when Pi receives a completion notification or checks their status.
 
-**Stop** also stops the Pi process when background jobs are active, allowing its extensions to clean up. The next message resumes the saved conversation. To stop just one job, ask Pi to kill that job with `bg_status`.
+Runs from the `pi-dynamic-workflows` package appear as workflows in the Agents panel, with each agent listed under its phase. A background run stays active after Pi replies. Its progress updates each time one of its agents finishes, and its result shows in the chat when Pi receives it. Pausing a run ends its entry; resuming it brings the entry back.
+
+**Stop** also stops the Pi process when background jobs or workflow runs are active, allowing its extensions to clean up. The next message resumes the saved conversation. To stop just one job, ask Pi to kill that job with `bg_status`.
 
 ## Limitations
 

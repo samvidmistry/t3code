@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off - background workflow runs are real files.
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -19,11 +24,14 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+
 import { ServerConfig } from "../../config.ts";
 import { make as makeBackgroundLiveness } from "../../orchestration/ThreadBackgroundLiveness.ts";
 import { runtimeEventToActivities } from "../../orchestration/Layers/ProviderRuntimeIngestion.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
+import { piWorkflowRunsDirectory } from "./PiWorkflowRuns.ts";
 import type {
   AgentSessionEvent,
   PiRpcTransport,
@@ -36,6 +44,7 @@ import type {
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const decodeRuntimeEvent = Schema.decodeUnknownEffect(ProviderRuntimeEvent);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const PI = ProviderDriverKind.make("pi");
 
 const HarnessLayer = ServerConfig.layerTest(process.cwd(), {
@@ -136,11 +145,12 @@ const makeFakePiRpcTransport = Effect.gen(function* () {
   } satisfies FakePiTransport;
 });
 
-const makePiAdapterForTest = (settings: PiSettings) =>
+const makePiAdapterForTest = (settings: PiSettings, environment?: NodeJS.ProcessEnv) =>
   Effect.gen(function* () {
     const fake = yield* makeFakePiRpcTransport;
     const adapter = yield* makePiAdapter(settings, {
       makeTransport: () => Effect.succeed(fake.transport),
+      ...(environment ? { environment } : {}),
     });
     return { adapter, fake } as const;
   });
@@ -375,6 +385,228 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
         payload: { state: "failed", errorMessage: "Rate limited" },
       });
     }),
+  );
+
+  it.effect("shows a foreground workflow run as a workflow with phased members", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-workflow-foreground");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "item.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "review it", attachments: [] });
+      const snapshot = (running: boolean) => ({
+        name: "review",
+        phases: ["Recon", "Critique"],
+        currentPhase: running ? "Critique" : "Critique",
+        logs: [],
+        agents: [
+          { id: 1, label: "recon", phase: "Recon", status: "done", prompt: "p", tokens: 40 },
+          {
+            id: 2,
+            label: "critic",
+            phase: "Critique",
+            status: running ? "running" : "done",
+            prompt: "p",
+          },
+        ],
+      });
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "wf-1",
+        toolName: "workflow",
+        args: { script: "export const meta = { name: 'review' }", background: false },
+      } as AgentSessionEvent);
+      for (const _ of [1, 2]) {
+        // An unchanged repeat snapshot adds no rows.
+        yield* fake.pushEvent({
+          type: "tool_execution_update",
+          toolCallId: "wf-1",
+          toolName: "workflow",
+          args: {},
+          partialResult: { content: [{ type: "text", text: "progress" }], details: snapshot(true) },
+        } as AgentSessionEvent);
+      }
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "wf-1",
+        toolName: "workflow",
+        result: {
+          content: [{ type: "text", text: "done" }],
+          details: { ...snapshot(false), runId: "review-run" },
+        },
+        isError: false,
+      } as AgentSessionEvent);
+      yield* Fiber.join(collected.fiber);
+      const tasks = (yield* Ref.get(collected.store)).filter((event) =>
+        event.type.startsWith("task."),
+      );
+      expect(
+        tasks.map((event) => [event.type, (event.payload as { taskId: string }).taskId]),
+      ).toEqual([
+        ["task.started", "pi-workflow:wf-1"],
+        ["task.progress", "pi-workflow:wf-1:wf:1"],
+        ["task.progress", "pi-workflow:wf-1:wf:2"],
+        ["task.progress", "pi-workflow:wf-1"],
+        ["task.progress", "pi-workflow:wf-1:wf:2"],
+        ["task.progress", "pi-workflow:wf-1"],
+        ["task.completed", "pi-workflow:wf-1"],
+      ]);
+      expect(tasks[0]!.payload).toMatchObject({
+        taskType: "local_workflow",
+        workflowName: "review",
+        toolUseId: "wf-1",
+      });
+      expect(tasks[2]!.payload).toMatchObject({
+        parentAgentId: "pi-workflow:wf-1",
+        agentIndex: 2,
+        phaseIndex: 1,
+        phaseTitle: "Critique",
+        status: "running",
+        timelineBypass: true,
+      });
+      expect(tasks[3]!.payload).toMatchObject({
+        summary: "Critique · 1/2 agents done, 1 running",
+        phases: [
+          { index: 0, title: "Recon" },
+          { index: 1, title: "Critique" },
+        ],
+      });
+      expect(tasks[5]!.payload).toMatchObject({ summary: "Critique · 2/2 agents done" });
+      expect(tasks[6]!.payload).toMatchObject({
+        status: "completed",
+        runHandles: { runId: "review-run" },
+      });
+    }),
+  );
+
+  it.effect("follows a background workflow run through its run file until its result lands", () =>
+    Effect.gen(function* () {
+      const home = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-workflow-home-")),
+      );
+      const runsDirectory = piWorkflowRunsDirectory(
+        process.cwd(),
+        { HOME: home, USERPROFILE: home },
+        yield* HostProcessPlatform,
+        NodePath,
+      );
+      const writeRun = (status: string, agentStatus: string) =>
+        Effect.promise(async () => {
+          await NodeFSP.mkdir(runsDirectory, { recursive: true });
+          await NodeFSP.writeFile(
+            NodePath.join(runsDirectory, "audit-run.json"),
+            encodeUnknownJsonString({
+              runId: "audit-run",
+              workflowName: "audit",
+              status,
+              phases: ["Scan"],
+              currentPhase: "Scan",
+              agents: [
+                { id: 1, label: "scanner", phase: "Scan", status: agentStatus, prompt: "p" },
+              ],
+              logs: [],
+              tokenUsage: { input: 1, output: 2, total: 3 },
+            }),
+          );
+        });
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => NodeFSP.rm(home, { recursive: true, force: true })),
+      );
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings(), {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+      });
+      const threadId = ThreadId.make("pi-workflow-background");
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const started = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "turn.completed",
+      );
+      yield* adapter.sendTurn({ threadId, input: "audit in the background", attachments: [] });
+      yield* writeRun("running", "running");
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "wf-bg",
+        toolName: "workflow",
+        result: {
+          content: [{ type: "text", text: "started" }],
+          details: { runId: "audit-run", background: true },
+        },
+        isError: false,
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({ type: "agent_settled" });
+      yield* Fiber.join(started.fiber);
+      const startedTasks = (yield* Ref.get(started.store)).filter((event) =>
+        event.type.startsWith("task."),
+      );
+      expect(startedTasks.map((event) => event.type)).toEqual([
+        "task.started",
+        "task.progress",
+        "task.progress",
+      ]);
+      expect(startedTasks[0]!.payload).toMatchObject({
+        taskId: "pi-workflow:audit-run",
+        taskType: "local_workflow",
+        runHandles: { runId: "audit-run" },
+      });
+      // Still live after the turn: Stop has to stop the Pi process that runs it.
+      expect(Result.isFailure(yield* adapter.rollbackThread(threadId, 1).pipe(Effect.result))).toBe(
+        true,
+      );
+
+      // The plugin delivers the result into a turn it triggers; by then the file is final.
+      yield* writeRun("completed", "done");
+      const finished = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "item.completed",
+      );
+      yield* fake.pushEvent({ type: "turn_start" } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "message_end",
+        message: {
+          role: "custom",
+          customType: "workflow-result",
+          content: `✓ Background workflow "audit" finished (1 agents).\n\n↳ Full result: ${runsDirectory}/audit-run.json`,
+          display: true,
+          timestamp: 0,
+        },
+      } as AgentSessionEvent);
+      yield* Fiber.join(finished.fiber);
+      const events = yield* Ref.get(finished.store);
+      expect(
+        events
+          .filter((event) => event.type.startsWith("task."))
+          .map((event) => [event.type, (event.payload as { status?: string }).status]),
+      ).toEqual([
+        ["task.progress", "completed"],
+        ["task.progress", undefined],
+        ["task.completed", "completed"],
+      ]);
+      expect(events.at(-1)).toMatchObject({
+        type: "item.completed",
+        payload: {
+          title: "Workflow result",
+          detail: '✓ Background workflow "audit" finished (1 agents).',
+        },
+      });
+    }).pipe(Effect.scoped),
   );
 
   it.effect("keeps bg live after the turn and settles from an idle custom completion", () =>

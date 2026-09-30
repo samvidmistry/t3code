@@ -34,10 +34,13 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
+
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import { ServerConfig } from "../../config.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -50,6 +53,15 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
+import {
+  isPiWorkflowRunId,
+  normalizePiWorkflowSnapshot,
+  piWorkflowBackgroundRunId,
+  piWorkflowCallName,
+  piWorkflowProgressSummary,
+  piWorkflowRunsDirectory,
+  type PiWorkflowSnapshot,
+} from "./PiWorkflowRuns.ts";
 import {
   piBackgroundCompletion,
   piBackgroundToolJobs,
@@ -156,6 +168,26 @@ interface BackgroundTaskState {
   completed: boolean;
 }
 
+// A dynamic-workflows run shown as a T3 workflow task with one member per agent.
+interface WorkflowRunState {
+  readonly taskId: RuntimeTaskId;
+  readonly toolUseId: string;
+  readonly turnId: TurnId | undefined;
+  /** Background runs are followed through their run file after the tool returns. */
+  readonly background: boolean;
+  runId: string | undefined;
+  name: string | undefined;
+  started: boolean;
+  completed: boolean;
+  progressFingerprint: string | undefined;
+  readonly memberFingerprints: Map<number, string>;
+}
+
+const decodeWorkflowRunFile = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+
+// Background runs are persisted after each finished agent; poll at a similar pace.
+const WORKFLOW_POLL_INTERVAL = "2 seconds";
+
 interface PiTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
@@ -208,16 +240,38 @@ interface PiSessionContext {
   currentContextWindow: number | undefined;
   compactsAutomatically: boolean | undefined;
   appliedThinkingLevel: PiThinkingLevel | undefined;
+  // Workflow runs by tool call id (foreground) or `run:<runId>` (background).
+  readonly workflowRuns: Map<string, WorkflowRunState>;
+  readonly workflowRunsDirectory: string;
+  workflowPolling: boolean;
   // One entry per T3 turn, oldest first: when T3 sent the turn's opening
   // prompt, or null for turns Pi started on its own. Rewind uses these to find
   // the Pi user message that opened a turn; steers never add an entry.
   turnStarts: Array<number | null>;
 }
 
+/** Text of a background workflow result the dynamic-workflows plugin delivered. */
+function piWorkflowResultMessage(message: unknown): string | undefined {
+  if (message === null || typeof message !== "object") return undefined;
+  const record = message as Record<string, unknown>;
+  if (record["role"] !== "custom" || record["customType"] !== "workflow-result") return undefined;
+  const content = record["content"];
+  if (typeof content === "string") return content.trim() || undefined;
+  if (!Array.isArray(content)) return undefined;
+  const text = content
+    .flatMap((part) =>
+      part !== null && typeof part === "object" && typeof part.text === "string" ? [part.text] : [],
+    )
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
 function hasBackgroundWork(context: PiSessionContext): boolean {
   return (
     context.backgroundLaunches.size > 0 ||
-    [...context.backgroundTasks.values()].some((task) => !task.completed)
+    [...context.backgroundTasks.values()].some((task) => !task.completed) ||
+    [...context.workflowRuns.values()].some((run) => run.background && !run.completed)
   );
 }
 
@@ -581,6 +635,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const baseEnvironment = options?.environment ?? process.env;
+  const hostPlatform = yield* HostProcessPlatform;
 
   let approvalExtensionPath: string | undefined;
   for (const candidate of APPROVAL_EXTENSION_CANDIDATES) {
@@ -870,6 +925,261 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context.backgroundLaunches.clear();
   });
 
+  // Mirrors Claude's workflow tasks: a `local_workflow` coordinator carrying the
+  // phases, plus a timeline-bypassing member row per agent that changed.
+  const emitWorkflow = Effect.fn("PiAdapter.emitWorkflow")(function* (
+    context: PiSessionContext,
+    run: WorkflowRunState,
+    snapshot: PiWorkflowSnapshot | undefined,
+    terminal?: { readonly status: "completed" | "failed" | "stopped"; readonly summary?: string },
+  ) {
+    if (run.completed) return;
+    if (snapshot?.name) run.name = snapshot.name;
+    if (snapshot?.runId) run.runId = snapshot.runId;
+    const title = run.name ?? "Workflow";
+    const linkage = {
+      taskType: "local_workflow",
+      title,
+      ...(run.name ? { workflowName: run.name } : {}),
+      toolUseId: run.toolUseId,
+      ...(run.runId ? { runHandles: { runId: run.runId } } : {}),
+    };
+    const offer = (event: Record<string, unknown>) =>
+      Effect.flatMap(makeEventStamp(), (stamp) =>
+        offerRuntimeEvent({
+          ...stamp,
+          provider: PROVIDER,
+          providerInstanceId: boundInstanceId,
+          threadId: context.session.threadId,
+          ...(run.turnId ? { turnId: run.turnId } : {}),
+          ...event,
+        } as ProviderRuntimeEvent),
+      );
+
+    if (!run.started) {
+      run.started = true;
+      yield* offer({
+        type: "task.started",
+        payload: { taskId: run.taskId, description: title, ...linkage },
+      });
+    }
+
+    const typedUsage =
+      snapshot?.tokens !== undefined ? { typedUsage: { totalTokens: snapshot.tokens } } : {};
+    if (snapshot) {
+      for (const agent of snapshot.agents) {
+        const phaseIndex = agent.phase ? snapshot.phases.indexOf(agent.phase) : -1;
+        const fingerprint = [
+          agent.status,
+          agent.label,
+          agent.model ?? "",
+          agent.error ?? "",
+          agent.tokens ?? "",
+          agent.phase ?? "",
+        ].join("\u001f");
+        if (run.memberFingerprints.get(agent.index) === fingerprint) continue;
+        run.memberFingerprints.set(agent.index, fingerprint);
+        yield* offer({
+          type: "task.progress",
+          payload: {
+            taskId: RuntimeTaskId.make(`${run.taskId}:wf:${agent.index}`),
+            description: agent.label,
+            title: agent.label,
+            status: agent.status,
+            ...(agent.error ? { error: agent.error } : {}),
+            ...(agent.model ? { model: agent.model } : {}),
+            ...(agent.tokens !== undefined ? { typedUsage: { totalTokens: agent.tokens } } : {}),
+            parentAgentId: run.taskId,
+            agentIndex: agent.index,
+            ...(phaseIndex >= 0 ? { phaseIndex, phaseTitle: agent.phase } : {}),
+            timelineBypass: true,
+          },
+        });
+      }
+      const summary = piWorkflowProgressSummary(snapshot);
+      const fingerprint = [title, summary, snapshot.phases.join("\u001f"), snapshot.tokens].join(
+        "\u001e",
+      );
+      if (fingerprint !== run.progressFingerprint) {
+        run.progressFingerprint = fingerprint;
+        yield* offer({
+          type: "task.progress",
+          payload: {
+            taskId: run.taskId,
+            description: title,
+            summary,
+            ...(terminal ? {} : { status: "running" }),
+            ...typedUsage,
+            ...(snapshot.phases.length > 0
+              ? {
+                  phases: snapshot.phases.map((phaseTitle, index) => ({
+                    index,
+                    title: phaseTitle,
+                  })),
+                }
+              : {}),
+            ...linkage,
+          },
+        });
+      }
+    }
+
+    if (!terminal) return;
+    run.completed = true;
+    const summary =
+      terminal.summary ??
+      `Workflow ${terminal.status}${snapshot ? `: ${piWorkflowProgressSummary(snapshot)}` : ""}`;
+    yield* offer({
+      type: "task.completed",
+      payload: {
+        taskId: run.taskId,
+        status: terminal.status,
+        summary,
+        ...typedUsage,
+        ...linkage,
+      },
+    });
+    for (const [key, candidate] of context.workflowRuns) {
+      if (candidate === run) context.workflowRuns.delete(key);
+    }
+  });
+
+  const pollWorkflowRun = Effect.fn("PiAdapter.pollWorkflowRun")(function* (
+    context: PiSessionContext,
+    run: WorkflowRunState,
+  ) {
+    if (run.completed || run.runId === undefined || !isPiWorkflowRunId(run.runId)) return;
+    const file = path.join(context.workflowRunsDirectory, `${run.runId}.json`);
+    // The plugin rewrites the file in place; skip a torn or missing read and retry next tick.
+    const parsed = yield* fileSystem
+      .readFileString(file)
+      .pipe(Effect.flatMap(decodeWorkflowRunFile), Effect.option);
+    if (parsed._tag === "None") return;
+    const snapshot = normalizePiWorkflowSnapshot(parsed.value);
+    if (!snapshot) return;
+    const status = snapshot.status;
+    yield* emitWorkflow(
+      context,
+      run,
+      snapshot,
+      status === undefined || status === "running"
+        ? undefined
+        : status === "paused"
+          ? {
+              status: "stopped",
+              summary: `Workflow paused: ${piWorkflowProgressSummary(snapshot)}`,
+            }
+          : { status },
+    );
+  });
+
+  const pollWorkflowRuns = (context: PiSessionContext) =>
+    Effect.forEach(
+      [...context.workflowRuns.values()].filter((run) => run.background),
+      (run) => pollWorkflowRun(context, run),
+      { discard: true },
+    );
+
+  /** Follow background runs until none are live; lives in the Pi process's scope. */
+  const ensureWorkflowPolling = (context: PiSessionContext) =>
+    Effect.gen(function* () {
+      if (context.workflowPolling || context.stopped) return;
+      context.workflowPolling = true;
+      const live = () =>
+        !context.stopped &&
+        [...context.workflowRuns.values()].some((run) => run.background && !run.completed);
+      yield* Effect.gen(function* () {
+        while (live()) {
+          yield* Effect.sleep(WORKFLOW_POLL_INTERVAL);
+          yield* pollWorkflowRuns(context);
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            context.workflowPolling = false;
+          }),
+        ),
+        Effect.forkIn(context.sessionScope),
+      );
+    });
+
+  const newWorkflowRun = (
+    context: PiSessionContext,
+    input: { taskId: string; toolUseId: string; background: boolean; runId?: string },
+  ): WorkflowRunState => ({
+    taskId: RuntimeTaskId.make(input.taskId),
+    toolUseId: input.toolUseId,
+    turnId: context.turnState?.turnId,
+    background: input.background,
+    runId: input.runId,
+    name: undefined,
+    started: false,
+    completed: false,
+    progressFingerprint: undefined,
+    memberFingerprints: new Map(),
+  });
+
+  const foregroundWorkflowRun = (context: PiSessionContext, toolCallId: string) => {
+    let run = context.workflowRuns.get(toolCallId);
+    if (!run) {
+      run = newWorkflowRun(context, {
+        taskId: `pi-workflow:${toolCallId}`,
+        toolUseId: toolCallId,
+        background: false,
+      });
+      context.workflowRuns.set(toolCallId, run);
+    }
+    return run;
+  };
+
+  /** Settle a foreground run from its result, or start following a background one. */
+  const trackWorkflowToolResult = Effect.fn("PiAdapter.trackWorkflowToolResult")(function* (
+    context: PiSessionContext,
+    event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
+    args: unknown,
+  ) {
+    const result = (event as { result?: unknown }).result;
+    const runId = event.isError ? undefined : piWorkflowBackgroundRunId(event.toolName, result);
+    if (runId !== undefined) {
+      const key = `run:${runId}`;
+      let run = context.workflowRuns.get(key);
+      if (!run) {
+        run = newWorkflowRun(context, {
+          taskId: `pi-workflow:${runId}`,
+          toolUseId: event.toolCallId,
+          background: true,
+          runId,
+        });
+        run.name = piWorkflowCallName(args);
+        context.workflowRuns.set(key, run);
+      }
+      yield* emitWorkflow(context, run, undefined);
+      yield* pollWorkflowRun(context, run);
+      yield* ensureWorkflowPolling(context);
+      return;
+    }
+    if (event.toolName !== "workflow") return;
+    const snapshot = normalizePiWorkflowSnapshot((result as { details?: unknown } | null)?.details);
+    const run = context.workflowRuns.get(event.toolCallId);
+    if (!snapshot && !run) return;
+    const foreground = run ?? foregroundWorkflowRun(context, event.toolCallId);
+    if (!foreground.name) foreground.name = piWorkflowCallName(args);
+    yield* emitWorkflow(context, foreground, snapshot, {
+      status: event.isError ? "failed" : "completed",
+    });
+  });
+
+  const finalizeWorkflowRuns = Effect.fn("PiAdapter.finalizeWorkflowRuns")(function* (
+    context: PiSessionContext,
+    status: "failed" | "stopped",
+    onlyForeground: boolean,
+  ) {
+    for (const run of context.workflowRuns.values()) {
+      if (onlyForeground && run.background) continue;
+      yield* emitWorkflow(context, run, undefined, { status });
+    }
+  });
+
   const completeTurn = (
     context: PiSessionContext,
     state: "completed" | "failed" | "interrupted" | "cancelled",
@@ -878,6 +1188,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     Effect.gen(function* () {
       const turnState = context.turnState;
       if (!turnState) return;
+      // A foreground run cannot outlive its tool call; background runs continue.
+      yield* finalizeWorkflowRuns(context, state === "failed" ? "failed" : "stopped", true);
       yield* finalizeSubagentTasks(
         context,
         state === "completed" ? "completed" : state === "failed" ? "failed" : "stopped",
@@ -941,6 +1253,53 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       });
       return turnId;
     });
+
+  // A background run's result, delivered by the plugin into the turn it triggers.
+  // Settle the run from its file now, then show the delivered text in that turn.
+  const emitWorkflowResult = Effect.fn("PiAdapter.emitWorkflowResult")(function* (
+    context: PiSessionContext,
+    content: string,
+  ) {
+    for (const run of context.workflowRuns.values()) {
+      if (run.background && run.runId !== undefined && content.includes(run.runId)) {
+        yield* pollWorkflowRun(context, run);
+      }
+    }
+    const turnState = context.turnState;
+    if (!turnState) return;
+    const itemId = RuntimeItemId.make(`pi-workflow-result-${yield* nextUuid}`);
+    const detail = content.split("\n", 1)[0]?.trim().slice(0, 500);
+    const item = {
+      provider: PROVIDER,
+      providerInstanceId: boundInstanceId,
+      threadId: context.session.threadId,
+      turnId: turnState.turnId,
+      itemId,
+    };
+    yield* offerRuntimeEvent({
+      ...(yield* makeEventStamp()),
+      ...item,
+      type: "item.started",
+      payload: {
+        itemType: "collab_agent_tool_call",
+        status: "inProgress",
+        title: "Workflow result",
+        ...(detail ? { detail } : {}),
+      },
+    });
+    yield* offerRuntimeEvent({
+      ...(yield* makeEventStamp()),
+      ...item,
+      type: "item.completed",
+      payload: {
+        itemType: "collab_agent_tool_call",
+        status: "completed",
+        title: "Workflow result",
+        ...(detail ? { detail } : {}),
+        data: { rawOutput: content },
+      },
+    });
+  });
 
   const handlePiEvent = (
     context: PiSessionContext,
@@ -1013,6 +1372,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           const job = piBackgroundCompletion(event.message);
           if (job) {
             yield* emitBackgroundTask(context, job);
+            return;
+          }
+          const delivered = piWorkflowResultMessage(event.message);
+          if (delivered !== undefined) {
+            yield* emitWorkflowResult(context, delivered);
             return;
           }
           const turnState = context.turnState;
@@ -1099,6 +1463,21 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           if (partial === undefined) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
 
+          // Foreground workflow runs stream their whole snapshot on every update.
+          if (event.toolName === "workflow") {
+            const snapshot = normalizePiWorkflowSnapshot(
+              (partial as { details?: unknown } | null)?.details,
+            );
+            if (snapshot) {
+              yield* emitWorkflow(
+                context,
+                foregroundWorkflowRun(context, event.toolCallId),
+                snapshot,
+              );
+              return;
+            }
+          }
+
           // The bundled `subagent` extension streams structured child snapshots;
           // map recognized snapshots to canonical task.* events instead of text.
           if (event.toolName === "subagent") {
@@ -1163,6 +1542,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           }
 
           const storedItem = context.turnState.items.find((item) => item.id === itemId);
+          if (event.toolName === "workflow" || event.toolName === "workflow_control") {
+            yield* trackWorkflowToolResult(context, event, storedItem?.args);
+          }
           const detail = summarizePiToolArgs(storedItem?.args);
           const argsObj =
             storedItem?.args && typeof storedItem.args === "object"
@@ -1474,6 +1856,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       yield* context.transport.kill;
       yield* Effect.ignore(Scope.close(context.sessionScope, Exit.void));
       yield* finalizeBackgroundTasks(context, opts?.exitKind === "error" ? "failed" : "stopped");
+      // Runs live in the Pi process; the plugin marks them paused on its next start.
+      yield* finalizeWorkflowRuns(
+        context,
+        opts?.exitKind === "error" ? "failed" : "stopped",
+        false,
+      );
 
       const updatedAt = yield* nowIso;
       const { activeTurnId: _activeTurnId, ...closedSession } = context.session;
@@ -1732,6 +2120,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       backgroundTasks: new Map(),
       backgroundLaunches: new Set(),
       thinkItemIds: new Set(),
+      workflowRuns: new Map(),
+      workflowRunsDirectory: piWorkflowRunsDirectory(cwd, processEnv, hostPlatform, path),
+      workflowPolling: false,
       stopped: false,
       currentModel: modelSelection?.model,
       currentContextWindow: undefined,
