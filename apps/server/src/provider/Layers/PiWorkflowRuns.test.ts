@@ -57,6 +57,15 @@ describe("PiWorkflowRuns", () => {
       script: "export const meta = {}",
     });
     expect(persisted).toMatchObject({ runId: "review-abc", status: "paused", tokens: 102 });
+    expect(
+      piWorkflowProgressSummary(
+        normalizePiWorkflowSnapshot({
+          status: "running",
+          phases: ["Scout and verify"],
+          agents: [],
+        })!,
+      ),
+    ).toBe("Scout and verify · agents working; each appears when it finishes");
     expect(normalizePiWorkflowSnapshot({ runId: "x", background: true })).toBeUndefined();
   });
 

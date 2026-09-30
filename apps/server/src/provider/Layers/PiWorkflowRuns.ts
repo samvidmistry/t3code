@@ -185,7 +185,11 @@ export function isPiWorkflowRunId(runId: string): boolean {
   return /^[A-Za-z0-9._-]{1,200}$/u.test(runId) && !runId.startsWith(".");
 }
 
-/** One-line coordinator progress, e.g. "Critique · 3/8 agents done, 2 running". */
+/**
+ * One-line coordinator progress, e.g. "Critique · 3/8 agents done, 2 running".
+ * A background run's file lists agents only once they finish, so an empty list
+ * on a live run means agents are working, not that the run is still starting.
+ */
 export function piWorkflowProgressSummary(snapshot: PiWorkflowSnapshot): string {
   const done = snapshot.agents.filter(
     (agent) => agent.status === "completed" || agent.status === "failed",
@@ -194,9 +198,13 @@ export function piWorkflowProgressSummary(snapshot: PiWorkflowSnapshot): string 
   const failed = snapshot.agents.filter((agent) => agent.status === "failed").length;
   const agents =
     snapshot.agents.length === 0
-      ? "starting"
+      ? snapshot.status === "running"
+        ? "agents working; each appears when it finishes"
+        : "starting"
       : `${done}/${snapshot.agents.length} agents done${running > 0 ? `, ${running} running` : ""}${
           failed > 0 ? `, ${failed} failed` : ""
         }`;
-  return snapshot.currentPhase ? `${snapshot.currentPhase} · ${agents}` : agents;
+  // Run files record a phase's title before its first agent reports back.
+  const phase = snapshot.currentPhase ?? snapshot.phases.at(-1);
+  return phase ? `${phase} · ${agents}` : agents;
 }
