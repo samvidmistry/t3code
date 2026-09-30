@@ -29,6 +29,6 @@ Recognized `subagent` extension results appear as agent activity. Jobs from `bg`
 
 Pi does not expose native plan mode. Use normal mode and tool approvals to control changes.
 
-Conversation rewind is unavailable: steering and extension messages mean Pi's native fork points do not reliably correspond to T3 Code turns. T3 Code will not guess a rewind point or restore files for an unsupported rewind.
+**Edit from here** forks the Pi session just before the chosen message, so the original session file stays on disk. It works for messages sent with this version of T3 Code or later; earlier messages cannot be rewound to.
 
 Extensions that require Pi's terminal UI, custom widgets or a custom editor do not have that UI in T3 Code. Standard confirmation, selection and text-input dialogs are supported.

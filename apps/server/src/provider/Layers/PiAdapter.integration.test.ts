@@ -9,6 +9,7 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   ApprovalRequestId,
@@ -99,7 +100,8 @@ const makeFakePiRpcTransport = Effect.gen(function* () {
           command.type === "prompt" ||
           command.type === "steer" ||
           command.type === "compact" ||
-          command.type === "abort"
+          command.type === "abort" ||
+          command.type === "fork"
         ) {
           commands.push(command);
           return (
@@ -544,7 +546,7 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
         yield* Fiber.join(fiber);
         expect(fake.wasKilled()).toBe(true);
         expect(yield* adapter.hasSession(threadId)).toBe(false);
-        expect(session.resumeCursor).toEqual({ sessionFile: "/tmp/pi-session.json" });
+        expect(session.resumeCursor).toMatchObject({ sessionFile: "/tmp/pi-session.json" });
         const events = yield* Ref.get(store);
         expect(
           events
@@ -596,17 +598,95 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
     }),
   );
 
-  it.effect("rejects unsafe conversation rewind without changing the session", () =>
+  it.effect("rewinds by forking before the prompt that opened the dropped turn", () =>
     Effect.gen(function* () {
       const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
-      const threadId = ThreadId.make("pi-rewind-disabled");
-      const session = yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
-      expect(adapter.capabilities.supportsConversationRollback).toBe(false);
-      expect(Result.isFailure(yield* adapter.rollbackThread(threadId, 1).pipe(Effect.result))).toBe(
+      const threadId = ThreadId.make("pi-rewind");
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+
+      const runTurn = (input: string, at: number) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(at);
+          yield* adapter.sendTurn({ threadId, input });
+          const completed = yield* collectEvents(
+            adapter,
+            threadId,
+            (event) => event.type === "turn.completed",
+          );
+          yield* fake.pushEvent({ type: "agent_settled" });
+          yield* Fiber.join(completed.fiber);
+        });
+      yield* runTurn("first", 1_000);
+      yield* runTurn("second", 2_000);
+      yield* runTurn("third", 3_000);
+      expect((yield* adapter.listSessions())[0]?.resumeCursor).toEqual({
+        sessionFile: "/tmp/pi-session.json",
+        turnStarts: [1_000, 2_000, 3_000],
+      });
+
+      const message = (id: string, parentId: string | null, role: string, timestamp: number) => ({
+        type: "message",
+        id,
+        parentId,
+        message: { role, content: id, timestamp },
+      });
+      fake.setResponse(
+        "get_entries",
+        asResponse({
+          type: "response",
+          command: "get_entries",
+          success: true,
+          data: {
+            entries: [
+              message("u1", null, "user", 1_010),
+              message("a1", "u1", "assistant", 1_020),
+              // An abandoned branch sent inside turn 2's window.
+              message("stale", "a1", "user", 2_005),
+              message("u2", "a1", "user", 2_010),
+              // A steer inside turn 2 is not a turn boundary.
+              message("steer", "u2", "user", 2_020),
+              message("a2", "steer", "assistant", 2_030),
+              message("u3", "a2", "user", 3_010),
+              message("a3", "u3", "assistant", 3_020),
+            ],
+            leafId: "a3",
+          },
+        }),
+      );
+      fake.setResponse(
+        "fork",
+        asResponse({
+          type: "response",
+          command: "fork",
+          success: true,
+          data: { text: "second", cancelled: false },
+        }),
+      );
+      fake.setResponse(
+        "get_state",
+        asResponse({
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: { sessionFile: "/tmp/pi-fork.json" },
+        }),
+      );
+
+      yield* adapter.rollbackThread(threadId, 2);
+      expect(fake.commands.filter((command) => command.type === "fork")).toEqual([
+        { type: "fork", entryId: "u2" },
+      ]);
+      expect((yield* adapter.listSessions())[0]?.resumeCursor).toEqual({
+        sessionFile: "/tmp/pi-fork.json",
+        turnStarts: [1_000],
+      });
+
+      // Turns older than the recorded boundaries are refused before any fork.
+      const forks = fake.commands.length;
+      expect(Result.isFailure(yield* adapter.rollbackThread(threadId, 2).pipe(Effect.result))).toBe(
         true,
       );
-      expect((yield* adapter.listSessions())[0]?.resumeCursor).toEqual(session.resumeCursor);
-      expect(fake.commands).toEqual([]);
+      expect(fake.commands.length).toBe(forks);
     }),
   );
 
@@ -848,7 +928,7 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
       });
       expect(session.provider).toBe("pi");
       expect(session.status).toBe("ready");
-      expect(session.resumeCursor).toEqual({ sessionFile: "/tmp/pi-session.json" });
+      expect(session.resumeCursor).toMatchObject({ sessionFile: "/tmp/pi-session.json" });
 
       const turn = yield* adapter.sendTurn({ threadId, input: "hello", attachments: [] });
       expect(turn.turnId).toBeDefined();

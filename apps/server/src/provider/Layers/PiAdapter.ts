@@ -25,6 +25,7 @@ import {
   TurnId,
   type UserInputQuestion,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -207,6 +208,10 @@ interface PiSessionContext {
   currentContextWindow: number | undefined;
   compactsAutomatically: boolean | undefined;
   appliedThinkingLevel: PiThinkingLevel | undefined;
+  // One entry per T3 turn, oldest first: when T3 sent the turn's opening
+  // prompt, or null for turns Pi started on its own. Rewind uses these to find
+  // the Pi user message that opened a turn; steers never add an entry.
+  turnStarts: Array<number | null>;
 }
 
 function hasBackgroundWork(context: PiSessionContext): boolean {
@@ -472,12 +477,83 @@ function toMessage(cause: unknown, fallback: string): string {
   return fallback;
 }
 
-function readPiResumeState(resumeCursor: unknown): { sessionFile: string } | undefined {
+// Bounds the resume cursor. Rewinds further back than this are refused.
+const MAX_TRACKED_PI_TURNS = 500;
+
+function readPiResumeState(
+  resumeCursor: unknown,
+): { sessionFile: string; turnStarts: Array<number | null> } | undefined {
   if (!resumeCursor || typeof resumeCursor !== "object") return undefined;
   const cursor = resumeCursor as Record<string, unknown>;
-  return typeof cursor["sessionFile"] === "string" && cursor["sessionFile"].trim().length > 0
-    ? { sessionFile: cursor["sessionFile"].trim() }
-    : undefined;
+  if (typeof cursor["sessionFile"] !== "string" || cursor["sessionFile"].trim().length === 0) {
+    return undefined;
+  }
+  const turnStarts = cursor["turnStarts"];
+  return {
+    sessionFile: cursor["sessionFile"].trim(),
+    // Cursors from before rewind support carry no boundaries; their turns
+    // stay unreachable rather than being guessed.
+    turnStarts:
+      Array.isArray(turnStarts) &&
+      turnStarts.every((value) => value === null || typeof value === "number")
+        ? [...(turnStarts as Array<number | null>)]
+        : [],
+  };
+}
+
+function piEntryTimestampMs(entry: Record<string, unknown>): number | undefined {
+  const message = entry["message"];
+  const messageTimestamp =
+    message !== null && typeof message === "object"
+      ? (message as Record<string, unknown>)["timestamp"]
+      : undefined;
+  if (typeof messageTimestamp === "number" && Number.isFinite(messageTimestamp)) {
+    return messageTimestamp;
+  }
+  const parsed = typeof entry["timestamp"] === "string" ? Date.parse(entry["timestamp"]) : NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Finds the user message that opened a T3 turn: the first user entry on Pi's
+ * active branch sent at or after `startedAt` and, when known, before the next
+ * turn's prompt. Branch entries come from `get_entries`, which also returns
+ * abandoned branches, so the path is walked from the leaf.
+ */
+export function findPiTurnStartEntryId(input: {
+  readonly entries: ReadonlyArray<unknown>;
+  readonly leafId: string | null;
+  readonly startedAt: number;
+  readonly nextStartedAt: number | undefined;
+}): string | undefined {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const entry of input.entries) {
+    if (entry === null || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    if (typeof record["id"] === "string") byId.set(record["id"], record);
+  }
+  const path: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  let cursor = input.leafId;
+  while (cursor !== null && !seen.has(cursor)) {
+    seen.add(cursor);
+    const entry = byId.get(cursor);
+    if (!entry) break;
+    path.push(entry);
+    cursor = typeof entry["parentId"] === "string" ? entry["parentId"] : null;
+  }
+  path.reverse();
+  for (const entry of path) {
+    if (entry["type"] !== "message") continue;
+    const message = entry["message"];
+    if (message === null || typeof message !== "object") continue;
+    if ((message as Record<string, unknown>)["role"] !== "user") continue;
+    const timestamp = piEntryTimestampMs(entry);
+    if (timestamp === undefined || timestamp < input.startedAt) continue;
+    if (input.nextStartedAt !== undefined && timestamp >= input.nextStartedAt) return undefined;
+    return entry["id"] as string;
+  }
+  return undefined;
 }
 
 export interface PiAdapterLiveOptions {
@@ -828,10 +904,24 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       });
     });
 
-  const openTurn = (context: PiSessionContext): Effect.Effect<TurnId> =>
+  const setResumeCursor = (context: PiSessionContext, sessionFile: string) => {
+    context.session = {
+      ...context.session,
+      resumeCursor: { sessionFile, turnStarts: [...context.turnStarts] },
+    };
+  };
+
+  const openTurn = (
+    context: PiSessionContext,
+    promptedAt: number | null = null,
+  ): Effect.Effect<TurnId> =>
     Effect.gen(function* () {
       const turnId = TurnId.make(yield* nextUuid);
       const startedAt = yield* nowIso;
+      context.turnStarts.push(promptedAt);
+      if (context.turnStarts.length > MAX_TRACKED_PI_TURNS) context.turnStarts.shift();
+      const sessionFile = readPiResumeState(context.session.resumeCursor)?.sessionFile;
+      if (sessionFile !== undefined) setResumeCursor(context, sessionFile);
       context.turnState = makeTurnState(turnId, startedAt);
       context.session = {
         ...context.session,
@@ -1647,6 +1737,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       currentContextWindow: undefined,
       compactsAutomatically: undefined,
       appliedThinkingLevel: thinkingLevel,
+      turnStarts: resumeState?.turnStarts ?? [],
     };
     sessions.set(threadId, context);
 
@@ -1686,9 +1777,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     const contextConfig = extractPiContextConfig(stateResponse);
     context.currentContextWindow = contextConfig.contextWindow;
     context.compactsAutomatically = contextConfig.compactsAutomatically;
-    if (sessionFile !== undefined) {
-      context.session = { ...context.session, resumeCursor: { sessionFile } };
-    }
+    setResumeCursor(context, sessionFile);
 
     // fail closed unless the gate extension registered its sentinel command
     if (verifyApprovalGate) {
@@ -1793,29 +1882,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       yield* applyThinkingLevel(context, input.modelSelection);
     }
 
-    if (!context.turnState) {
-      const turnId = TurnId.make(yield* nextUuid);
-      const startedAt = yield* nowIso;
-      context.turnState = makeTurnState(turnId, startedAt);
-      context.session = {
-        ...context.session,
-        status: "running",
-        activeTurnId: turnId,
-        updatedAt: startedAt,
-      };
-      const stamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        ...stamp,
-        type: "turn.started",
-        provider: PROVIDER,
-        providerInstanceId: boundInstanceId,
-        threadId: context.session.threadId,
-        turnId,
-        payload: context.currentModel ? { model: context.currentModel } : {},
-      });
-    }
-
-    const turnId = context.turnState.turnId;
+    // Pi stamps the prompt's user message after this instant.
+    const turnId = context.turnState
+      ? context.turnState.turnId
+      : yield* openTurn(context, yield* Clock.currentTimeMillis);
 
     const command = buildPiTurnCommand({ isMidTurn, message: promptText, images });
     const response = yield* context.transport.request(
@@ -1978,17 +2048,88 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     };
   });
 
-  // Pi forks at native user messages, not T3 turns: steers and extension
-  // prompts make counting those messages unsafe. Reject before file restore.
-  const rollbackThread: PiAdapterShape["rollbackThread"] = () =>
-    Effect.fail(
-      new ProviderAdapterValidationError({
-        provider: PROVIDER,
-        operation: "rollbackThread",
-        issue:
-          "Pi conversation rewind is not supported. Resume the saved session or start a new thread instead.",
-      }),
-    );
+  // Pi forks before a native user message into a new session file, leaving
+  // the original intact. Steers and extension prompts are user messages too,
+  // so the turn's opening prompt is located by when T3 sent it.
+  const rollbackThread: PiAdapterShape["rollbackThread"] = Effect.fn("rollbackThread")(
+    function* (threadId, numTurns) {
+      const context = yield* requireSession(threadId);
+      const fail = (detail: string) =>
+        new ProviderAdapterRequestError({ provider: PROVIDER, method: "fork", detail });
+      if (!Number.isInteger(numTurns) || numTurns < 1) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "numTurns must be an integer >= 1.",
+        });
+      }
+      if (context.turnState || hasBackgroundWork(context)) {
+        return yield* fail("Wait for the running Pi turn and background tasks before rewinding.");
+      }
+      const retained = context.turnStarts.length - numTurns;
+      const startedAt = retained >= 0 ? context.turnStarts[retained] : undefined;
+      if (startedAt === undefined || startedAt === null) {
+        return yield* fail(
+          "Pi can only rewind to a message sent from T3 Code since rewind support was added. Start a new thread instead.",
+        );
+      }
+      const nextStartedAt =
+        context.turnStarts.slice(retained + 1).find((value): value is number => value !== null) ??
+        undefined;
+
+      const entriesResponse = yield* context.transport.request(
+        { type: "get_entries" },
+        `pi-get-entries-${yield* nextUuid}`,
+        60_000,
+      );
+      const entriesData = piResponseData(entriesResponse);
+      if (!piResponseSucceeded(entriesResponse, "get_entries") || !entriesData) {
+        return yield* fail("Pi did not return its session history.");
+      }
+      const entryId = findPiTurnStartEntryId({
+        entries: Array.isArray(entriesData["entries"]) ? entriesData["entries"] : [],
+        leafId: typeof entriesData["leafId"] === "string" ? entriesData["leafId"] : null,
+        startedAt,
+        nextStartedAt,
+      });
+      if (entryId === undefined) {
+        return yield* fail("The Pi message that started this turn is no longer in the session.");
+      }
+
+      const forkResponse = yield* context.transport.request(
+        { type: "fork", entryId },
+        `pi-fork-${yield* nextUuid}`,
+        60_000,
+      );
+      if (!piResponseSucceeded(forkResponse, "fork")) {
+        return yield* fail(
+          forkResponse?.success === false ? forkResponse.error : "Pi did not fork the session.",
+        );
+      }
+      if (piResponseData(forkResponse)?.["cancelled"] === true) {
+        return yield* fail("A Pi extension cancelled the rewind.");
+      }
+
+      const stateResponse = yield* context.transport.request(
+        { type: "get_state" },
+        `pi-get-state-${yield* nextUuid}`,
+        PI_STATE_TIMEOUT_MS,
+      );
+      const sessionFile = extractSessionFile(stateResponse);
+      if (sessionFile === undefined) {
+        // The process now runs an unknown session; the saved cursor still
+        // points at the untouched original, so restart from that on next use.
+        yield* stopSessionInternal(context, { emitExitEvent: true });
+        return yield* fail("Pi did not report the rewound session file.");
+      }
+      context.turnStarts = context.turnStarts.slice(0, retained);
+      // The forked runtime restores its own settings; reapply ours next turn.
+      context.appliedThinkingLevel = undefined;
+      setResumeCursor(context, sessionFile);
+      context.session = { ...context.session, updatedAt: yield* nowIso };
+      return { threadId, turns: [] };
+    },
+  );
 
   const stopSession: PiAdapterShape["stopSession"] = Effect.fn("stopSession")(function* (threadId) {
     const context = yield* requireSession(threadId);
@@ -2027,7 +2168,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session" as const,
-      supportsConversationRollback: false,
     },
     startSession,
     sendTurn,
