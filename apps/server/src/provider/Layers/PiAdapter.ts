@@ -54,6 +54,13 @@ import {
 } from "../Errors.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import {
+  PI_CODEMODE_TOOL,
+  piCodemodeCode,
+  piCodemodeDetail,
+  piCodemodeOutput,
+  piCodemodeScript,
+} from "./PiCodemode.ts";
+import {
   isPiWorkflowRunId,
   normalizePiWorkflowSnapshot,
   piWorkflowBackgroundRunId,
@@ -248,6 +255,12 @@ interface PiSessionContext {
   // prompt, or null for turns Pi started on its own. Rewind uses these to find
   // the Pi user message that opened a turn; steers never add an entry.
   turnStarts: Array<number | null>;
+}
+
+/** A tool call another tool made, such as a codemode script's `tools.read(...)`. */
+function isNestedToolEvent(event: object): boolean {
+  const parent = (event as { parentToolCallId?: unknown }).parentToolCallId;
+  return typeof parent === "string" && parent.length > 0;
 }
 
 /** Text of a background workflow result the dynamic-workflows plugin delivered. */
@@ -1405,6 +1418,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         case "tool_execution_start": {
           if (!context.turnState) return;
           if (event.toolName === "bg") context.backgroundLaunches.add(event.toolCallId);
+          // A codemode script's own calls are listed on the script's row.
+          if (isNestedToolEvent(event)) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
 
           // `think` renders as reasoning, not a tool row. The whole payload
@@ -1423,7 +1438,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           }
 
           const itemType = classifyPiToolItemType(event.toolName);
-          const detail = summarizePiToolArgs(event.args);
+          const isScript = event.toolName === PI_CODEMODE_TOOL;
+          const detail = isScript
+            ? piCodemodeDetail(piCodemodeCode(event.args))
+            : summarizePiToolArgs(event.args);
           const argsObj =
             event.args && typeof event.args === "object"
               ? (event.args as Record<string, unknown>)
@@ -1443,7 +1461,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               status: "inProgress" as const,
               title: event.toolName,
               ...(detail ? { detail } : {}),
-              ...(argsObj ? { data: { item: { toolName: event.toolName, input: argsObj } } } : {}),
+              ...(argsObj
+                ? {
+                    data: {
+                      item: { toolName: event.toolName, input: argsObj },
+                      ...(isScript ? { script: piCodemodeScript({ args: argsObj }) } : {}),
+                    },
+                  }
+                : {}),
             },
           };
           yield* offerRuntimeEvent({ ...toolEvent, type: "item.started" });
@@ -1462,6 +1487,35 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           const partial = (event as { partialResult?: unknown }).partialResult;
           if (partial === undefined) return;
           const itemId = RuntimeItemId.make(event.toolCallId);
+          const nested = isNestedToolEvent(event);
+
+          // Each call a script makes republishes the script's call list.
+          if (event.toolName === PI_CODEMODE_TOOL && !nested) {
+            const stored = context.turnState.items.find((item) => item.id === itemId);
+            const args = stored?.args ?? event.args;
+            yield* offerRuntimeEvent({
+              ...base,
+              turnId: context.turnState.turnId,
+              itemId,
+              type: "item.updated",
+              payload: {
+                itemType: classifyPiToolItemType(event.toolName),
+                status: "inProgress",
+                title: event.toolName,
+                ...(piCodemodeDetail(piCodemodeCode(args))
+                  ? { detail: piCodemodeDetail(piCodemodeCode(args)) }
+                  : {}),
+                data: {
+                  item: { toolName: event.toolName },
+                  script: piCodemodeScript({
+                    args,
+                    details: (partial as { details?: unknown } | null)?.details,
+                  }),
+                },
+              },
+            });
+            return;
+          }
 
           // Foreground workflow runs stream their whole snapshot on every update.
           if (event.toolName === "workflow") {
@@ -1493,6 +1547,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             }
           }
 
+          if (nested) return;
           const itemType = classifyPiToolItemType(event.toolName);
           const delta = extractPiPartialResultText(partial);
           if (delta === undefined || delta.length === 0) return;
@@ -1541,18 +1596,32 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             }
           }
 
+          if (isNestedToolEvent(event)) return;
           const storedItem = context.turnState.items.find((item) => item.id === itemId);
           if (event.toolName === "workflow" || event.toolName === "workflow_control") {
             yield* trackWorkflowToolResult(context, event, storedItem?.args);
           }
-          const detail = summarizePiToolArgs(storedItem?.args);
+          const isScript = event.toolName === PI_CODEMODE_TOOL;
+          const detail = isScript
+            ? piCodemodeDetail(piCodemodeCode(storedItem?.args))
+            : summarizePiToolArgs(storedItem?.args);
           const argsObj =
             storedItem?.args && typeof storedItem.args === "object"
               ? (storedItem.args as Record<string, unknown>)
               : undefined;
           // Use upstream's output projection shapes. Retain one copy of the
           // result; the shared projector produces the bounded client preview.
-          const result = extractPiPartialResultText((event as { result?: unknown }).result);
+          const fullResult = extractPiPartialResultText((event as { result?: unknown }).result);
+          const result = isScript ? piCodemodeOutput(fullResult) : fullResult;
+          const script = isScript
+            ? piCodemodeScript({
+                args: storedItem?.args,
+                details: ((event as { result?: unknown }).result as { details?: unknown } | null)
+                  ?.details,
+                ...(fullResult !== undefined ? { output: fullResult } : {}),
+                isError: event.isError,
+              })
+            : undefined;
           yield* offerRuntimeEvent({
             ...base,
             turnId: context.turnState.turnId,
@@ -1574,6 +1643,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
                         ...(argsObj ? { input: argsObj } : {}),
                         ...(result !== undefined && itemType === "mcp_tool_call" ? { result } : {}),
                       },
+                      ...(script ? { script } : {}),
                     },
                   }
                 : {}),

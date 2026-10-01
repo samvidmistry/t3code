@@ -21,6 +21,47 @@ function activity(payload: Record<string, unknown>): OrchestrationThreadActivity
  * assertions are the tripwire.
  */
 describe("projectActivityPayload", () => {
+  it("keeps a script's code and calls, bounded", () => {
+    const projected = projectActivityPayload(
+      activity({
+        itemType: "dynamic_tool_call",
+        data: {
+          item: { toolName: "codemode", input: { code: "x" } },
+          script: {
+            code: "c".repeat(30_000),
+            calls: [
+              ...Array.from({ length: 300 }, (_, index) => ({
+                name: "read",
+                args: "a".repeat(400),
+                status: "ok",
+                durationMs: index,
+              })),
+              { name: "websearch", args: "{}", status: "error", error: "e".repeat(900) },
+              { status: "ok" },
+            ],
+            failed: true,
+            wallTimeMs: 900,
+          },
+        },
+      }),
+    );
+    const script = (projected.payload as { data: { script: Record<string, unknown> } }).data
+      .script as {
+      code: string;
+      calls: Array<{ name: string; args: string; error?: string }>;
+      omittedCalls: number;
+    };
+    expect(script.code).toHaveLength(20_000);
+    expect(script.calls).toHaveLength(255);
+    expect(script.omittedCalls).toBe(46);
+    expect(script.calls[0]!.args).toHaveLength(300);
+    expect(script.calls.at(-1)).toMatchObject({ name: "websearch", status: "error" });
+    expect(script.calls.at(-1)!.error).toHaveLength(500);
+    expect(projected.payload).toMatchObject({
+      data: { script: { failed: true, wallTimeMs: 900 } },
+    });
+  });
+
   it("preserves tool attribution (agentId/parentToolUseId) through data slimming", () => {
     const projected = projectActivityPayload(
       activity({

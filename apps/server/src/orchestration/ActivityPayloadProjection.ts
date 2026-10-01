@@ -359,6 +359,53 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
   return projectedData;
 }
 
+const SCRIPT_CODE_CHARS = 20_000;
+const SCRIPT_CALLS = 256;
+const SCRIPT_CALL_ARGS_CHARS = 300;
+const SCRIPT_CALL_ERROR_CHARS = 500;
+
+/**
+ * A script tool (Pi's codemode) and the tool calls it made, bounded for clients.
+ * Calls stay on the script's row: the model never issued them itself.
+ */
+function projectScriptData(value: unknown): Record<string, unknown> | undefined {
+  const script = asRecord(value);
+  if (!script || typeof script.code !== "string") return undefined;
+  const calls = (Array.isArray(script.calls) ? script.calls : [])
+    .slice(-SCRIPT_CALLS)
+    .flatMap((entry) => {
+      const call = asRecord(entry);
+      const name = asTrimmedString(call?.name);
+      if (!call || !name || typeof call.status !== "string") return [];
+      return [
+        {
+          name,
+          status: call.status,
+          args: typeof call.args === "string" ? call.args.slice(0, SCRIPT_CALL_ARGS_CHARS) : "",
+          ...(typeof call.durationMs === "number" ? { durationMs: call.durationMs } : {}),
+          ...(typeof call.error === "string"
+            ? { error: call.error.slice(0, SCRIPT_CALL_ERROR_CHARS) }
+            : {}),
+          ...(typeof call.cost === "number" ? { cost: call.cost } : {}),
+        },
+      ];
+    });
+  return {
+    code: script.code.slice(0, SCRIPT_CODE_CHARS),
+    calls,
+    ...(Array.isArray(script.calls) && script.calls.length > SCRIPT_CALLS
+      ? { omittedCalls: script.calls.length - SCRIPT_CALLS }
+      : {}),
+    ...(script.failed === true ? { failed: true } : {}),
+    ...(typeof script.wallTimeMs === "number" ? { wallTimeMs: script.wallTimeMs } : {}),
+    ...(typeof script.fullOutputPath === "string" ? { fullOutputPath: script.fullOutputPath } : {}),
+    ...(typeof script.outputPreview === "string"
+      ? { outputPreview: script.outputPreview.slice(0, 2_000) }
+      : {}),
+    ...(typeof script.outputLines === "number" ? { outputLines: script.outputLines } : {}),
+  };
+}
+
 function projectRawOutput(value: unknown): Record<string, unknown> | undefined {
   const direct = asTrimmedString(value);
   if (direct) {
@@ -464,6 +511,10 @@ export function projectActivityPayload(
   const imagePath = projectViewedImagePath(data);
   if (imagePath) {
     projectedData.imagePath = imagePath;
+  }
+  const script = projectScriptData(data.script);
+  if (script) {
+    projectedData.script = script;
   }
 
   const changedFiles: string[] = [];

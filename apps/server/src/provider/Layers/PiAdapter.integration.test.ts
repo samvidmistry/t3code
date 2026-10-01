@@ -387,6 +387,110 @@ it.layer(HarnessLayer)("PiAdapter integration", (it) => {
     }),
   );
 
+  it.effect("shows a codemode script as one row that lists the calls it made", () =>
+    Effect.gen(function* () {
+      const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
+      const threadId = ThreadId.make("pi-codemode");
+      const collected = yield* collectEvents(
+        adapter,
+        threadId,
+        (event) => event.type === "item.completed",
+      );
+      yield* adapter.startSession({
+        threadId,
+        provider: PI,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "read both", attachments: [] });
+      const code =
+        "// two files\nconst r = await Promise.all([tools.read({path:'a'}), tools.read({path:'b'})]);\nreturn r.join('');";
+      const call = (status: string, extra: Record<string, unknown> = {}) => ({
+        id: "cm-1/1",
+        name: "read",
+        args: '{"path":"a"}',
+        status,
+        ...extra,
+      });
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "cm-1",
+        toolName: "codemode",
+        args: { code },
+      } as AgentSessionEvent);
+      // The script's own call is reported too, but belongs to the script's row.
+      yield* fake.pushEvent({
+        type: "tool_execution_start",
+        toolCallId: "cm-1/1",
+        toolName: "read",
+        args: { path: "a" },
+        parentToolCallId: "cm-1",
+      } as unknown as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_update",
+        toolCallId: "cm-1",
+        toolName: "codemode",
+        args: { code },
+        partialResult: { content: [], details: { calls: [call("running")] } },
+      } as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "cm-1/1",
+        toolName: "read",
+        result: { content: [{ type: "text", text: "A" }] },
+        isError: false,
+        parentToolCallId: "cm-1",
+      } as unknown as AgentSessionEvent);
+      yield* fake.pushEvent({
+        type: "tool_execution_end",
+        toolCallId: "cm-1",
+        toolName: "codemode",
+        result: {
+          content: [
+            { type: "text", text: "Script failed\nWall time 0.4 seconds\nOutput:\n" },
+            { type: "text", text: "partial\nScript error:\nboom" },
+          ],
+          details: {
+            calls: [call("ok", { durationMs: 8.6 }), { ...call("error"), error: "ENOENT" }],
+            fullOutputPath: "/tmp/out.txt",
+          },
+        },
+        isError: true,
+      } as AgentSessionEvent);
+      yield* Fiber.join(collected.fiber);
+      const items = (yield* Ref.get(collected.store)).filter((event) =>
+        event.type.startsWith("item."),
+      );
+      expect(new Set(items.map((event) => event.itemId))).toEqual(new Set(["cm-1"]));
+      expect(items.find((event) => event.type === "item.started")!.payload).toMatchObject({
+        detail: "const r = await Promise.all([tools.read({path:'a'}), tools.read({path:'b'})]);",
+        data: { script: { code, calls: [] } },
+      });
+      const running = items.findLast((event) => event.type === "item.updated")!;
+      expect(running.payload).toMatchObject({
+        data: { script: { calls: [{ name: "read", args: '{"path":"a"}', status: "running" }] } },
+      });
+      expect(items.at(-1)!.payload).toMatchObject({
+        status: "failed",
+        data: {
+          rawOutput: "partial\nScript error:\nboom",
+          script: {
+            code,
+            failed: true,
+            wallTimeMs: 400,
+            fullOutputPath: "/tmp/out.txt",
+            outputPreview: "partial\nScript error:\nboom",
+            outputLines: 3,
+            calls: [
+              { name: "read", status: "ok", durationMs: 9 },
+              { name: "read", status: "error", error: "ENOENT" },
+            ],
+          },
+        },
+      });
+    }),
+  );
+
   it.effect("shows a foreground workflow run as a workflow with phased members", () =>
     Effect.gen(function* () {
       const { adapter, fake } = yield* makePiAdapterForTest(enabledSettings());
