@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   OrchestrationV2ProjectedTurnItem,
+  OrchestrationV2TurnItem,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -233,6 +234,55 @@ function ToolCallBody(
   );
 }
 
+function ScriptBody({
+  script,
+}: {
+  readonly script: NonNullable<
+    Extract<OrchestrationV2TurnItem, { type: "dynamic_tool" }>["script"]
+  >;
+}) {
+  return (
+    <div className="space-y-2">
+      <StructuredValue value={script.code} language="typescript" />
+      {script.wallTimeMs !== undefined || script.failed ? (
+        <p className={script.failed ? "text-destructive" : "text-muted-foreground"}>
+          {script.failed ? "Script failed" : "Script completed"}
+          {script.wallTimeMs !== undefined ? ` in ${script.wallTimeMs / 1_000}s` : ""}
+        </p>
+      ) : null}
+      {script.calls.length > 0 ? (
+        <div className={cn("max-h-64 overflow-auto", monoClassName)}>
+          <p className="text-muted-foreground">Tool calls</p>
+          <ul className="space-y-1">
+            {script.calls.map((call, index) => (
+              <li key={index} className={call.status === "error" ? "text-destructive" : undefined}>
+                {call.name} — {call.status}
+                {call.durationMs !== undefined ? ` (${call.durationMs}ms)` : ""}
+                {call.args ? <span className="text-muted-foreground"> {call.args}</span> : null}
+                {call.error ? <p>{call.error}</p> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {script.omittedCalls ? (
+        <p className="text-muted-foreground">{script.omittedCalls} earlier calls omitted</p>
+      ) : null}
+      {script.outputPreview ? (
+        <div>
+          <p className="text-muted-foreground">Output preview</p>
+          <StructuredValue value={script.outputPreview} />
+        </div>
+      ) : null}
+      {script.fullOutputPath ? (
+        <p className={cn("text-muted-foreground", monoClassName)}>
+          Full output: {script.fullOutputPath}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspectorProps) {
   // Command rows stream their output, including the final output, from the server.
   const streamsOutput =
@@ -375,12 +425,22 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
       ) : null}
 
       {item.type === "dynamic_tool" ? (
-        <ToolCallBody
-          toolName={item.toolName}
-          args={item.input}
-          {...outputState}
-          onImageExpand={props.onImageExpand}
-        />
+        item.script ? (
+          <ScriptBody
+            script={
+              props.projectedItem.item.type === "dynamic_tool"
+                ? (props.projectedItem.item.script ?? item.script)
+                : item.script
+            }
+          />
+        ) : (
+          <ToolCallBody
+            toolName={item.toolName}
+            args={item.input}
+            {...outputState}
+            onImageExpand={props.onImageExpand}
+          />
+        )
       ) : null}
 
       {item.type === "approval_request" ? <StructuredValue value={item.prompt} /> : null}

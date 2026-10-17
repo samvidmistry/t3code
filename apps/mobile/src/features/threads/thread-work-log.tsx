@@ -985,10 +985,15 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
   const fetchedItem = fetchedDetail.data?.item ?? null;
   const isRead = toolGroupAction(row.workEntry) === "read";
   const shownItem = fetchedItem ?? row.projectedItem.item;
+  const script =
+    row.projectedItem.item.type === "dynamic_tool"
+      ? (row.projectedItem.item.script ??
+        (shownItem.type === "dynamic_tool" ? shownItem.script : undefined))
+      : undefined;
   const call =
     expanded && !isRead && shownItem.type === "command_execution"
       ? toolCallLines({ command: shownItem.input })
-      : expanded && !isRead && shownItem.type === "dynamic_tool"
+      : expanded && !isRead && !script && shownItem.type === "dynamic_tool"
         ? toolCallLines({ args: shownItem.input })
         : expanded && shownItem.type === "file_search"
           ? toolCallLines({ args: { pattern: shownItem.pattern } })
@@ -1000,7 +1005,7 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
       ? shownItem.exitCode
       : null;
   const fullDetail =
-    expanded && !reasoning && !call
+    expanded && !reasoning && !call && !script
       ? fetchedItem && !isRead
         ? formatItemFullDetail(row.projectedItem, fetchedItem)
         : row.getFullDetail()
@@ -1008,7 +1013,7 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
   const outputImages = expanded && fetchedItem ? turnItemOutputImages(fetchedItem) : [];
   const viewedImagePath = workEntryViewedImagePath(row.workEntry);
   const fetchedOutput =
-    !expanded || streamsOutput
+    !expanded || streamsOutput || script
       ? null
       : shownItem.type === "file_search" || shownItem.type === "web_search"
         ? turnItemOutputText(shownItem)
@@ -1175,6 +1180,7 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
 
       {expanded &&
       (reasoning ||
+        script ||
         fullDetail ||
         call ||
         fetchedOutput ||
@@ -1225,6 +1231,52 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
           >
             {reasoning ? (
               props.renderReasoning(reasoning.text)
+            ) : script ? (
+              <View className="gap-1.5">
+                <ReplCodeText code={script.code} theme={props.themeAppearance} />
+                {script.wallTimeMs !== undefined || script.failed ? (
+                  <Text className="text-2xs text-foreground-muted">
+                    {script.failed ? "Script failed" : "Script completed"}
+                    {script.wallTimeMs !== undefined ? ` in ${script.wallTimeMs / 1_000}s` : ""}
+                  </Text>
+                ) : null}
+                {script.calls.length > 0 ? (
+                  <Text className="text-2xs text-foreground-muted">Tool calls</Text>
+                ) : null}
+                {script.calls.map((scriptCall, index) => (
+                  <Text
+                    key={index}
+                    selectable
+                    className={cn(
+                      "font-mono text-2xs leading-normal",
+                      scriptCall.status === "error" ? "text-danger-foreground" : "text-foreground",
+                    )}
+                  >
+                    {scriptCall.name} — {scriptCall.status}
+                    {scriptCall.durationMs !== undefined ? ` (${scriptCall.durationMs}ms)` : ""}
+                    {scriptCall.args ? ` ${scriptCall.args}` : ""}
+                    {scriptCall.error ? `\n${scriptCall.error}` : ""}
+                  </Text>
+                ))}
+                {script.omittedCalls ? (
+                  <Text className="text-2xs text-foreground-muted">
+                    {script.omittedCalls} earlier calls omitted
+                  </Text>
+                ) : null}
+                {script.outputPreview ? (
+                  <View>
+                    <Text className="text-2xs text-foreground-muted">Output preview</Text>
+                    <Text selectable className="font-mono text-2xs text-foreground-muted">
+                      {script.outputPreview}
+                    </Text>
+                  </View>
+                ) : null}
+                {script.fullOutputPath ? (
+                  <Text selectable className="font-mono text-2xs text-foreground-muted">
+                    Full output: {script.fullOutputPath}
+                  </Text>
+                ) : null}
+              </View>
             ) : call ? (
               [
                 call.command,

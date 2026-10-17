@@ -51,6 +51,11 @@ Pi loads its normal user and project extensions. Blocking `select`, `confirm`, `
 dialogs work in T3 Code. Notifications appear in the work log. Pi terminal decoration such as
 titles, status lines, and widgets does not have a T3 Code equivalent.
 
+When Pi uses `codemode`, expand its **Script** work-log row to see the code, live tool-call
+statuses, elapsed time, and an output preview. Calls made inside the script stay in that row
+instead of appearing as separate entries. Long scripts, call histories, and output are shortened
+to keep remote clients responsive.
+
 ## Permission Modes
 
 T3 Code applies the composer permission mode through Pi's blocking tool hook:
@@ -71,6 +76,13 @@ T3 Code's `delegate_task` tool creates durable child threads in the shared subag
 installs Pi's example `subagent` extension, T3 Code also shows its task progress and results in that
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
+
+Jobs started with the `bg` extension stay listed as background work after Pi replies, until Pi
+receives their completion or `bg_status` reports them finished. Runs from the
+`pi-dynamic-workflows` package appear as workflows in the Agents panel, with each agent under its
+phase; a background run keeps updating after Pi replies. **Stop** also stops the Pi process while
+background jobs or workflow runs are active so its extensions can clean up. The next message resumes
+the same conversation. To stop a single job, ask Pi to kill it with `bg_status`.
 
 ## Troubleshooting
 

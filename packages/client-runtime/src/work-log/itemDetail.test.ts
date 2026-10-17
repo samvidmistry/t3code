@@ -2,7 +2,12 @@ import { ThreadId, TurnItemId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import { turnItemOutputImages, turnItemOutputText } from "./itemDetail.ts";
+import {
+  turnItemHasDetail,
+  turnItemNeedsDetailFetch,
+  turnItemOutputImages,
+  turnItemOutputText,
+} from "./itemDetail.ts";
 
 const screenshot = {
   id: TurnItemId.make("tool-screenshot"),
@@ -88,5 +93,21 @@ describe("tool output images", () => {
       expect(turnItemOutputText(item)).toBe("Read /tmp/blk.png.\n[image]\n[image]");
       expect(turnItemOutputImages(item)).toHaveLength(1);
     }
+  });
+});
+
+describe("script tool details", () => {
+  it("expands bounded script metadata without fetching or duplicating code in input", () => {
+    const item = {
+      ...screenshot,
+      toolName: "codemode",
+      input: {},
+      output: undefined,
+      script: { code: "await tools.read({ path: 'a.ts' })", calls: [] },
+    };
+    expect(turnItemHasDetail(item)).toBe(true);
+    expect(turnItemNeedsDetailFetch(item)).toBe(false);
+    expect(turnItemOutputText(item)).toBeNull();
+    expect(turnItemHasDetail({ ...item, script: undefined })).toBe(false);
   });
 });

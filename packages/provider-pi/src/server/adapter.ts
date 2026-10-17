@@ -72,6 +72,19 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import { isNestedToolEvent, piCodemodeScript } from "./codemode.ts";
+import {
+  makePiBackgroundJobs,
+  piBackgroundCompletion,
+  piBackgroundToolJobs,
+  type PiBackgroundJob,
+} from "./backgroundJobs.ts";
+import { makePiSubagentTracker, type PiSubagentUpdate } from "./subagents.ts";
+import {
+  makePiWorkflowRuns,
+  piWorkflowProgressSummary,
+  piWorkflowRunsDirectory,
+} from "./workflows.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -360,6 +373,7 @@ interface ActivePiTurn {
   readonly streamItems: Map<string, PiStreamItemState>;
   readonly toolArgs: Map<string, unknown>;
   readonly toolStartedAt: Map<string, DateTime.Utc>;
+  readonly subagents: ReturnType<typeof makePiSubagentTracker>;
   interrupted: boolean;
   nativeAborted: boolean;
   sawAgentActivity: boolean;
@@ -527,6 +541,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       let stopRequested = false;
       let unsolicitedActivityDetected = false;
       let pendingWake: PiWake | null = null;
+      const backgroundJobs = makePiBackgroundJobs();
       let rollbackBarrier: Deferred.Deferred<
         void,
         ProviderAdapter.ProviderAdapterProtocolError
@@ -536,6 +551,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         Effect.gen(function* () {
           closed = true;
           pendingWake = null;
+          backgroundJobs.clear();
+          if (threadState !== null) {
+            threadState.providerThread = {
+              ...threadState.providerThread,
+              pendingBackgroundTasks: [],
+            };
+          }
           if (rollbackBarrier !== null)
             yield* Deferred.fail(
               rollbackBarrier,
@@ -611,6 +633,28 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...(retainedNativeTurnIds === undefined ? {} : { retainedNativeTurnIds }),
           });
         });
+
+      const hasBackgroundWork = () =>
+        backgroundJobs.hasPendingWork() || workflowRuns.hasPendingBackgroundWork();
+
+      const updateBackgroundJobs = Effect.fnUntraced(function* (
+        state: PiThreadState,
+        jobs: ReadonlyArray<PiBackgroundJob>,
+        fromStatusSnapshot = false,
+      ) {
+        if (backgroundJobs.observe(jobs, fromStatusSnapshot)) {
+          yield* updateProviderThread(state, {
+            pendingBackgroundTasks: backgroundJobs.pendingTasks(),
+          });
+        }
+      });
+
+      const clearBackgroundJobs = Effect.fnUntraced(function* () {
+        yield* workflowRuns.stop;
+        if (backgroundJobs.clear() && threadState !== null) {
+          yield* updateProviderThread(threadState, { pendingBackgroundTasks: [] });
+        }
+      });
 
       const itemOrdinal = (turn: ActivePiTurn, nativeItemId: string): number => {
         const existing = turn.itemOrdinals.get(nativeItemId);
@@ -975,6 +1019,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         event: PiRpcRecord,
         phase: "start" | "update" | "end",
       ) {
+        if (isNestedToolEvent(event)) return;
         const toolCallId = recordString(event, "toolCallId");
         const toolName = recordString(event, "toolName") ?? "tool";
         if (toolCallId === undefined) return;
@@ -1050,6 +1095,28 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             return;
           }
         }
+        if (toolName === "codemode") {
+          const script = piCodemodeScript({
+            args,
+            details: recordField(resultRecord, "details"),
+            output: outputText,
+            isError,
+          });
+          yield* emit({
+            type: "turn_item.updated",
+            driver: PI_PROVIDER,
+            turnItem: {
+              ...shared,
+              title: "Script",
+              type: "dynamic_tool",
+              toolName,
+              input: {},
+              script,
+              ...(outputText.length > 0 ? { output: outputText } : {}),
+            },
+          });
+          return;
+        }
         const output = piToolOutput(resultRecord, toolName);
         yield* emit({
           type: "turn_item.updated",
@@ -1065,52 +1132,42 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           },
         });
         if (toolName === "subagent") {
-          yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
+          yield* emitSubagentUpdates(
+            turn,
+            turn.subagents.update(toolCallId, resultRecord, completed),
+          );
         }
+        yield* workflowRuns.trackTool(
+          turn,
+          toolName,
+          toolCallId,
+          args,
+          resultRecord,
+          phase,
+          isError,
+        );
       });
 
-      const emitSubagentTasks = Effect.fnUntraced(function* (
+      const emitSubagentUpdates = Effect.fnUntraced(function* (
         turn: ActivePiTurn,
-        toolCallId: string,
-        resultRecord: unknown,
-        completed: boolean,
+        updates: ReadonlyArray<PiSubagentUpdate>,
       ) {
-        const results = recordField(recordField(resultRecord, "details"), "results");
-        if (!Array.isArray(results)) return;
         const emittedAt = yield* DateTime.now;
-        const parentNodeId = idAllocator.derive.nodeFromProviderItem({
-          driver: PI_PROVIDER,
-          nativeItemId: toolCallId,
-        });
-        for (const [index, result] of results.entries()) {
-          const agent = recordString(result, "agent");
-          const task = recordString(result, "task");
-          if (agent === undefined || task === undefined) continue;
-          const nativeTaskId = `${toolCallId}:subagent:${recordNumber(result, "step") ?? index}`;
+        for (const update of updates) {
+          const { nativeTaskId, toolCallId, child, status, result: resultText } = update;
+          const { agent, task } = child;
+          const parentNodeId = idAllocator.derive.nodeFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId: toolCallId,
+          });
           const subagentId = idAllocator.derive.nodeFromProviderItem({
             driver: PI_PROVIDER,
             nativeItemId: nativeTaskId,
           });
           const startedAt = turn.toolStartedAt.get(nativeTaskId) ?? emittedAt;
           turn.toolStartedAt.set(nativeTaskId, startedAt);
-          const finished = completed || recordField(result, "finished") === true;
-          const stopReason = recordString(result, "stopReason");
-          const interrupted = finished && stopReason === "aborted";
-          const failed =
-            finished &&
-            !interrupted &&
-            ((recordNumber(result, "exitCode") ?? 0) !== 0 || stopReason === "error");
-          const status = interrupted
-            ? "interrupted"
-            : failed
-              ? "failed"
-              : finished
-                ? "completed"
-                : "running";
-          const outputText = piSubagentOutput(result);
-          const progress =
-            !finished && outputText.length > 0 ? { progress: outputText.slice(0, 200) } : {};
-          const resultText = finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null;
+          const finished = status !== "running";
+          const progress = update.progress === undefined ? {} : { progress: update.progress };
           yield* emit({
             type: "subagent.updated",
             driver: PI_PROVIDER,
@@ -1128,7 +1185,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               nativeTaskRef: providerRef(nativeTaskId),
               prompt: task,
               title: agent,
-              model: recordString(result, "model") ?? null,
+              model: child.model,
               status,
               ...progress,
               result: resultText,
@@ -1157,6 +1214,75 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             },
           });
         }
+      });
+
+      const piHome =
+        ((yield* HostProcess.isWindows) ? launch.env.USERPROFILE : launch.env.HOME) ||
+        (yield* HostProcess.HomeDirectory);
+      const workflowRuns = yield* makePiWorkflowRuns<ActivePiTurn>({
+        directory: piWorkflowRunsDirectory(cwd, piHome),
+        fileSystem,
+        scope,
+        publish: Effect.fnUntraced(function* (run, snapshot, status, emittedAt) {
+          const turn = run.context;
+          const subagentId = idAllocator.derive.nodeFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId: run.nativeTaskId,
+          });
+          const parentNodeId = idAllocator.derive.nodeFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId: run.toolCallId,
+          });
+          const completedAt = status === "running" || status === "waiting" ? null : emittedAt;
+          const progress = piWorkflowProgressSummary(snapshot);
+          const title = snapshot.name ?? "Workflow";
+          yield* emit({
+            type: "subagent.updated",
+            driver: PI_PROVIDER,
+            subagent: {
+              id: subagentId,
+              threadId: turn.turnInput.threadId,
+              runId: turn.turnInput.runId,
+              parentNodeId,
+              origin: "provider_native",
+              createdBy: "agent",
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              providerThreadId: turn.turnInput.providerThread.id,
+              childThreadId: null,
+              nativeTaskRef: providerRef(run.nativeTaskId),
+              prompt: title,
+              title,
+              model: null,
+              status,
+              progress,
+              workflow: snapshot.workflow,
+              result: completedAt === null ? null : progress,
+              startedAt: run.startedAt,
+              completedAt,
+              updatedAt: emittedAt,
+            },
+          });
+          yield* emit({
+            type: "turn_item.updated",
+            driver: PI_PROVIDER,
+            turnItem: {
+              ...baseItemFields(turn, run.nativeTaskId, run.startedAt, emittedAt),
+              type: "subagent",
+              subagentId,
+              title,
+              status,
+              origin: "provider_native",
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              childThreadId: null,
+              prompt: title,
+              progress,
+              result: completedAt === null ? null : progress,
+              completedAt,
+            },
+          });
+        }),
       });
 
       const cancelPrompt = (pending: PendingPiPrompt, resolvedAt: DateTime.Utc) =>
@@ -1478,6 +1604,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const interrupted = turn.interrupted || turn.nativeAborted;
         const completedAt = yield* DateTime.now;
         yield* completeOpenStreamItems(turn);
+        const childStatus =
+          !interrupted && (turn.failure !== null || turn.rejectedPromptFailure !== null)
+            ? "failed"
+            : "interrupted";
+        yield* emitSubagentUpdates(turn, turn.subagents.finalize(childStatus));
+        yield* workflowRuns.finalizeTurn(turn, childStatus);
         if (turn.activeCompaction !== null) {
           const status = interrupted ? "cancelled" : turn.failure === null ? "completed" : "failed";
           yield* emitCompaction(turn, turn.activeCompaction, status);
@@ -1629,6 +1761,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       });
 
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        if (event["type"] === "message_end" && threadState !== null) {
+          const completion = piBackgroundCompletion(event["message"]);
+          if (completion !== undefined) {
+            yield* updateBackgroundJobs(threadState, [completion]);
+            return;
+          }
+        }
         // Model-selection hooks can await a dialog before startTurn can claim
         // a wake. Keep interactive requests session-scoped until a turn owns
         // them; buffer native output and notifications for that turn.
@@ -1754,6 +1893,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           case "tool_execution_start":
             if (turn !== null) {
               turn.sawAgentActivity = true;
+              if (event["toolName"] === "bg") {
+                backgroundJobs.startLaunch(recordString(event, "toolCallId") ?? "bg");
+              }
               yield* emitToolItem(turn, event, "start");
             }
             return;
@@ -1761,6 +1903,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             if (turn !== null) yield* emitToolItem(turn, event, "update");
             return;
           case "tool_execution_end":
+            backgroundJobs.endLaunch(recordString(event, "toolCallId") ?? "bg");
+            if (
+              state !== null &&
+              (event["toolName"] === "bg" || event["toolName"] === "bg_status")
+            ) {
+              yield* updateBackgroundJobs(
+                state,
+                piBackgroundToolJobs(
+                  recordString(event, "toolName") ?? "",
+                  event["result"],
+                  event["isError"] === true,
+                ),
+                event["toolName"] === "bg_status",
+              );
+            }
             if (turn !== null) yield* emitToolItem(turn, event, "end");
             return;
           case "compaction_start": {
@@ -2103,6 +2260,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   protocolError("Pi transport closed during rollback"),
                 );
               pendingWake = null;
+              yield* clearBackgroundJobs();
               const interrupted = state?.activeTurn?.interrupted === true;
               if (state?.activeTurn != null) {
                 state.activeTurn.failure = interrupted
@@ -2166,11 +2324,24 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             "Cannot switch Pi threads while native work is awaiting a turn",
           );
         }
+        if (hasBackgroundWork()) {
+          const state = threadState;
+          if (
+            state !== null &&
+            state.providerThread.appThreadId === threadInput.threadId &&
+            (threadInput.existingProviderThread === undefined ||
+              threadInput.existingProviderThread.nativeThreadRef?.nativeId ===
+                state.providerThread.nativeThreadRef?.nativeId)
+          )
+            return state.providerThread;
+          return yield* protocolError("Cannot switch Pi threads while background work is running");
+        }
         const existing = threadInput.existingProviderThread;
         const resumeId = existing?.nativeThreadRef?.nativeId;
         const needsNewSession = resumeId == null && registrationAttempted;
         registrationAttempted = true;
         if (resumeId != null || needsNewSession) {
+          yield* clearBackgroundJobs();
           lastNativeThreadId = resumeId ?? lastNativeThreadId;
           // Even a failed lifecycle operation can change Pi's native session.
           // Never leave the old app binding or model defaults usable afterward.
@@ -2230,6 +2401,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           existing !== undefined
             ? {
                 ...existing,
+                pendingBackgroundTasks: [],
                 providerSessionId: input.providerSessionId,
                 nativeThreadRef: providerRef(nativeId),
                 ...(needsNewSession ? { nativeConversationHeadRef: null, contextUsage: null } : {}),
@@ -2360,10 +2532,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
+        backgroundTasksEndWithProcess: true,
+        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null || hasBackgroundWork()),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
-            () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
+            () =>
+              (pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id) ||
+              (threadState?.providerThread.id === providerThread.id && hasBackgroundWork()),
           ),
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
@@ -2485,6 +2660,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               streamItems: new Map(),
               toolArgs: new Map(),
               toolStartedAt: new Map(),
+              subagents: makePiSubagentTracker(),
               interrupted: false,
               nativeAborted: false,
               sawAgentActivity: false,
@@ -2523,7 +2699,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 return yield* protocolError("Pi native wake belongs to a different app thread");
               }
               pendingWake = null;
-              state.providerThread = turnInput.providerThread;
+              state.providerThread = {
+                ...turnInput.providerThread,
+                pendingBackgroundTasks: state.providerThread.pendingBackgroundTasks,
+              };
               state.activeTurn = activeTurn;
               activeTurn.adoptedWake = wake !== null && !continuation;
               if (compactCommand !== null) {
@@ -2657,9 +2836,22 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         interruptTurn: (interruptInput) =>
           Effect.gen(function* () {
             const turn = threadState?.activeTurn ?? null;
-            if (turn === null && interruptInput.requestRuntimeRestart === true) {
-              if (pendingWake !== null)
+            if (
+              hasBackgroundWork() &&
+              threadState?.providerThread.id !== interruptInput.providerThread.id
+            ) {
+              return yield* protocolError("Pi background work belongs to a different thread");
+            }
+            if (
+              turn === null &&
+              (interruptInput.requestRuntimeRestart === true || hasBackgroundWork())
+            ) {
+              if (pendingWake !== null) {
                 yield* sessionEventPermit.withPermits(1)(stopPendingWake(pendingWake));
+              } else if (hasBackgroundWork()) {
+                stopRequested = true;
+                yield* connection.terminate;
+              }
               return;
             }
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
@@ -2668,12 +2860,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             turn.interrupted = true;
             if (
               interruptInput.requestRuntimeRestart === true ||
+              hasBackgroundWork() ||
               turn.settleWhenIdle ||
               turn.activeCompaction !== null ||
               turn.manualCompactInFlight
             ) {
-              // Pi's generic abort does not cancel manual compaction. Terminate
-              // so Stop covers user /compact as well as detached recovery compact.
+              // Abort leaves bg jobs and manual compaction alive; terminate their owning process.
               stopRequested = true;
               if (interruptInput.requestRuntimeRestart === true && !turn.settleWhenIdle) {
                 yield* request({ type: "abort" }, 2_000).pipe(Effect.ignore);
@@ -2855,6 +3047,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             if (pendingWake !== null) {
               return yield* protocolError("Cannot roll back while native Pi work awaits a turn");
             }
+            if (hasBackgroundWork()) {
+              return yield* protocolError("Cannot roll back while Pi background work is running");
+            }
             const forkEntryId = piRollbackForkEntry(rollbackInput);
             if (forkEntryId === null) {
               return piThreadSnapshot(state.providerThread);
@@ -2870,6 +3065,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     threadState !== state ||
                     state.activeTurn !== null ||
                     pendingWake !== null ||
+                    hasBackgroundWork() ||
                     closed ||
                     stopRequested
                   )
@@ -3143,27 +3339,6 @@ function piRollbackForkEntry(input: {
   if (ref == null) return null;
   if (ref.strength !== "strong" || ref.nativeId === null) return undefined;
   return ref.nativeId;
-}
-
-function piSubagentOutput(result: unknown): string {
-  const stopReason = recordString(result, "stopReason");
-  const failed =
-    (recordNumber(result, "exitCode") ?? 0) !== 0 ||
-    stopReason === "error" ||
-    stopReason === "aborted";
-  if (failed) {
-    const failure = recordString(result, "errorMessage") || recordString(result, "stderr");
-    if (failure !== undefined && failure.length > 0) return failure;
-  }
-  const messages = recordField(result, "messages");
-  if (!Array.isArray(messages)) return "";
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (recordString(message, "role") !== "assistant") continue;
-    const text = contentText(recordField(message, "content"));
-    if (text.length > 0) return text;
-  }
-  return "";
 }
 
 function piExtensionDisplayName(extensionPath: string | undefined): string {

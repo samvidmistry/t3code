@@ -40,6 +40,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import { handoffBudget } from "@t3tools/provider-core/server/handoffBudget";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { toolOutputImages, compactDynamicToolOutput } from "@t3tools/shared/toolOutput";
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import {
   makePiAdapterV2,
   PiAdapterV2Driver,
@@ -2173,6 +2174,242 @@ describe("PiAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("keeps nested codemode calls on one live script row", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const code = 'await tools.read({ path: "a.ts" });';
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "script",
+        toolName: "codemode",
+        args: { code },
+      });
+      for (const toolName of ["read", "bash", "write"]) {
+        for (const phase of ["start", "update", "end"]) {
+          yield* fake.emit({
+            type: `tool_execution_${phase}`,
+            toolCallId: `nested-${toolName}`,
+            parentToolCallId: "script",
+            toolName,
+            args: { path: "a.ts", command: "echo hi", content: "nested" },
+            partialResult: { content: [{ type: "text", text: "nested partial" }] },
+            result: { content: [{ type: "text", text: "nested done" }] },
+          });
+        }
+      }
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolCallId: "script",
+        toolName: "codemode",
+        partialResult: { details: { calls: [{ name: "read", args: "a.ts", status: "running" }] } },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "script",
+        toolName: "codemode",
+        isError: true,
+        result: {
+          content: [
+            { type: "text", text: "Script failed\nWall time 0.25 seconds\nOutput:\npreview" },
+          ],
+          details: { calls: [{ name: "read", args: "a.ts", status: "error", error: "not found" }] },
+        },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "marker",
+        toolName: "marker",
+        result: { content: [{ type: "text", text: "after script" }] },
+      });
+      const items: Array<
+        Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>["turnItem"]
+      > = [];
+      yield* takeEvent((event) => {
+        if (event.type !== "turn_item.updated") return false;
+        items.push(event.turnItem);
+        return event.turnItem.nativeItemRef?.nativeId === "marker";
+      });
+      assert.deepEqual(
+        items.map((item) => item.nativeItemRef?.nativeId),
+        ["script", "script", "script", "marker"],
+      );
+      const scripts = items.flatMap((item) =>
+        item.type === "dynamic_tool" && item.toolName === "codemode" ? [item] : [],
+      );
+      assert.deepEqual(
+        scripts.map((item) => item.status),
+        ["running", "running", "failed"],
+      );
+      assert.deepEqual(scripts[0]?.script, { code, calls: [] });
+      assert.deepEqual(scripts[1]?.script?.calls, [
+        { name: "read", args: "a.ts", status: "running" },
+      ]);
+      assert.deepEqual(scripts[2]?.input, {});
+      assert.equal(scripts[2]?.output, "Script failed\nWall time 0.25 seconds\nOutput:\npreview");
+      assert.deepEqual(scripts[2]?.script, {
+        code,
+        calls: [{ name: "read", args: "a.ts", status: "error", error: "not found" }],
+        failed: true,
+        wallTimeMs: 250,
+        outputPreview: "preview",
+        outputLines: 1,
+      });
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("projects live workflow tools into coordinators and member agents", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "workflow-call",
+        toolName: "workflow",
+        args: { name: "Review" },
+      });
+      const started = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.workflow !== undefined,
+      );
+      assert.isTrue(
+        started.type === "subagent.updated" &&
+          started.subagent.title === "Review" &&
+          started.subagent.status === "running",
+      );
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolCallId: "workflow-call",
+        toolName: "workflow",
+        partialResult: {
+          details: {
+            name: "Review",
+            runId: "review-run",
+            phases: ["Explore"],
+            agents: [
+              {
+                id: 1,
+                label: "Reader",
+                status: "running",
+                phase: "Explore",
+                tokenUsage: { total: 42 },
+              },
+            ],
+            tokenUsage: { total: 42 },
+          },
+        },
+      });
+      const progress = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" && event.subagent.workflow?.agents.length === 1,
+      );
+      assert.isTrue(progress.type === "subagent.updated");
+      if (progress.type !== "subagent.updated") return;
+      assert.equal(progress.subagent.progress, "Explore · 0/1 agents done, 1 running");
+      assert.deepEqual(progress.subagent.workflow, {
+        name: "Review",
+        runHandles: { runId: "review-run" },
+        phases: [{ index: 0, title: "Explore" }],
+        agents: [
+          {
+            index: 1,
+            label: "Reader",
+            state: "running",
+            phaseIndex: 0,
+            phaseTitle: "Explore",
+            totalTokens: 42,
+          },
+        ],
+        totalTokens: 42,
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "workflow-call",
+        toolName: "workflow",
+        result: { content: [{ type: "text", text: "finished" }] },
+      });
+      const completed = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" &&
+          event.subagent.workflow !== undefined &&
+          event.subagent.status === "completed",
+      );
+      assert.isTrue(
+        completed.type === "subagent.updated" &&
+          completed.subagent.id === progress.subagent.id &&
+          completed.subagent.completedAt !== null,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("terminalizes unfinished Pi children when the turn settles", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolCallId: "unfinished-child",
+        toolName: "subagent",
+        partialResult: {
+          details: {
+            mode: "single",
+            results: [
+              {
+                agent: "scout",
+                task: "inspect",
+                exitCode: -1,
+                messages: [
+                  {
+                    role: "assistant",
+                    content: [{ type: "toolCall", name: "read", id: "child-read" }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      const running = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.status === "running",
+      );
+      yield* fake.emit({ type: "agent_settled" });
+      const closed = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
+      );
+      assert.isTrue(
+        running.type === "subagent.updated" &&
+          closed.type === "subagent.updated" &&
+          running.subagent.id === closed.subagent.id &&
+          closed.subagent.completedAt !== null,
+      );
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("observes official subagent results without inventing child threads", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
@@ -2202,6 +2439,10 @@ describe("PiAdapterV2", () => {
                 sessionFile: "/ignored/custom-extension-session.jsonl",
                 messages: [
                   { role: "assistant", content: [{ type: "text", text: "scanning files" }] },
+                  {
+                    role: "assistant",
+                    content: [{ type: "toolCall", id: "child-bash", name: "bash", arguments: {} }],
+                  },
                 ],
               },
             ],
@@ -2215,7 +2456,7 @@ describe("PiAdapterV2", () => {
         running.type === "subagent.updated" &&
           running.subagent.title === "scout" &&
           running.subagent.prompt === "map the repo" &&
-          running.subagent.progress === "scanning files" &&
+          running.subagent.progress === "Using bash" &&
           running.subagent.childThreadId === null,
       );
 
@@ -2263,6 +2504,209 @@ describe("PiAdapterV2", () => {
           subagentItem.turnItem.childThreadId === null,
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "keeps Pi background jobs across turns until an out-of-turn bg-result completes them",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "bg-launch",
+          toolName: "bg",
+          isError: false,
+          result: { details: { jobId: 1, command: "npm test", description: "Run tests" } },
+        });
+        const launch = yield* takeEvent(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.pendingBackgroundTasks?.length === 1,
+        );
+        assert.isTrue(launch.type === "provider_thread.updated");
+        assert.deepEqual(
+          launch.type === "provider_thread.updated" && launch.providerThread.pendingBackgroundTasks,
+          [{ taskId: "pi-bg:1", description: "Run tests", kind: "command" }],
+        );
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+        assert.isFalse(
+          yield* runtime.hasPendingBackgroundWorkForThread!({
+            ...providerThread,
+            id: ProviderThreadId.make("another-pi-thread"),
+          }),
+        );
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+        const rollback = yield* runtime
+          .rollbackThread({
+            providerThread,
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("start"),
+              appRunOrdinal: 0,
+            },
+            providerThreadTurns: [],
+          })
+          .pipe(Effect.result);
+        assert.equal(rollback._tag, "Failure");
+        assert.isFalse(fake.allRequests().some((request) => request["type"] === "fork"));
+
+        // A caller can still hold the pre-launch thread snapshot when the next turn starts.
+        yield* startTurn(runtime, providerThread, "default", [], "Next turn", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_settled" });
+        const idle = yield* takeEvent(
+          (event) =>
+            event.type === "provider_thread.updated" && event.providerThread.status === "idle",
+        );
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        if (idle.type !== "provider_thread.updated")
+          return yield* Effect.die("Expected provider thread");
+        assert.deepEqual(
+          derivePendingBackgroundWork({
+            latestRun: { id: RunId.make("second-run"), ordinal: 2, status: "completed" },
+            providerThreads: [idle.providerThread],
+            turnItems: [],
+          }),
+          [{ taskId: "pi-bg:1", description: "Run tests", kind: "command" }],
+        );
+
+        yield* fake.emit({
+          type: "message_end",
+          message: {
+            role: "custom",
+            customType: "bg-result",
+            details: { jobId: 1, command: "npm test", description: "Run tests", status: "done" },
+          },
+        });
+        const completed = yield* takeEvent(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.pendingBackgroundTasks?.length === 0,
+        );
+        assert.isTrue(completed.type === "provider_thread.updated");
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+        assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("removes completed bg_status jobs without resurrecting them from stale snapshots", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const job = { id: 3, command: "npm test", description: "Run tests" };
+      const snapshot = (status: string) =>
+        fake.emit({
+          type: "tool_execution_end",
+          toolCallId: `status-${status}`,
+          toolName: "bg_status",
+          isError: false,
+          result: { details: { jobs: [{ ...job, status }] } },
+        });
+      yield* snapshot("running");
+      yield* takeEvent(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.pendingBackgroundTasks?.length === 1,
+      );
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* snapshot("failed");
+      yield* takeEvent(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.pendingBackgroundTasks?.length === 0,
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      yield* snapshot("running");
+      yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.status === "completed" &&
+          event.turnItem.nativeItemRef?.nativeId === "status-running",
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["launching", "running", "settled"] as const)(
+    "stops the Pi process and clears background work while a job is %s",
+    (phase) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        const started = yield* takeEvent((event) => event.type === "provider_turn.updated");
+        if (started.type !== "provider_turn.updated")
+          return yield* Effect.die("Expected provider turn");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "launch",
+          toolName: "bg",
+          args: {},
+        });
+        yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        );
+        if (phase !== "launching") {
+          yield* fake.emit({
+            type: "tool_execution_end",
+            toolCallId: "launch",
+            toolName: "bg",
+            isError: false,
+            result: { details: { jobId: 1, command: "npm test", description: "Run tests" } },
+          });
+          yield* takeEvent(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.pendingBackgroundTasks?.length === 1,
+          );
+        }
+        if (phase === "settled") {
+          yield* fake.emit({ type: "agent_settled" });
+          yield* takeEvent((event) => event.type === "turn.terminal");
+        }
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+        yield* runtime.interruptTurn({ providerThread, providerTurnId: started.providerTurn.id });
+        let rosterCleared = false;
+        yield* takeEvent((event) => {
+          if (
+            event.type === "provider_thread.updated" &&
+            event.providerThread.pendingBackgroundTasks?.length === 0
+          ) {
+            rosterCleared = true;
+          }
+          return (
+            event.type === "provider_session.updated" && event.providerSession.status === "stopped"
+          );
+        });
+        assert.isFalse(fake.allRequests().some((request) => request["type"] === "abort"));
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+        assert.isTrue(rosterCleared);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("persists edit patches and write content on file change items", () =>

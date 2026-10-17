@@ -1324,6 +1324,26 @@ const OrchestrationV2SecretRequestFields = {
   secretStatus: OrchestrationV2SecretRequestStatus,
 } as const;
 
+const OrchestrationV2ToolScript = Schema.Struct({
+  code: Schema.String,
+  calls: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      args: Schema.String,
+      status: Schema.Literals(["running", "ok", "error", "cancelled"]),
+      durationMs: Schema.optional(NonNegativeInt),
+      error: Schema.optional(Schema.String),
+      cost: Schema.optional(Schema.Number),
+    }),
+  ),
+  omittedCalls: Schema.optional(NonNegativeInt),
+  failed: Schema.optional(Schema.Boolean),
+  wallTimeMs: Schema.optional(NonNegativeInt),
+  fullOutputPath: Schema.optional(Schema.String),
+  outputPreview: Schema.optional(Schema.String),
+  outputLines: Schema.optional(NonNegativeInt),
+});
+
 export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1520,6 +1540,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     toolName: Schema.NullOr(TrimmedNonEmptyString),
     viewedImagePath: Schema.optional(TrimmedNonEmptyString),
     input: Schema.Unknown,
+    /** Bounded script and nested calls, kept on the model-issued tool's row. */
+    script: Schema.optional(OrchestrationV2ToolScript),
     output: Schema.optional(Schema.Unknown),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
     outputOmitted: Schema.optional(Schema.Boolean),
