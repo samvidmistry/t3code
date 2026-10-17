@@ -1,3 +1,9 @@
+import {
+  type ConnectionTarget,
+  connectionRouteId,
+  connectionRouteLabel,
+  connectionRoutes,
+} from "@t3tools/client-runtime/connection";
 import type { DesktopSshEnvironmentTarget, EnvironmentMachineKind } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import type { ReactNode } from "react";
@@ -12,13 +18,24 @@ export function formatDesktopSshTarget(target: DesktopSshEnvironmentTarget): str
   return target.port ? `${authority}:${target.port}` : authority;
 }
 
-/**
- * How this client reaches a machine, printed first in every environment row so
- * T3 Connect, SSH, WSL, and plain remote links are told apart without a legend.
- */
-export function environmentTransportLabel(environment: EnvironmentPresentation): string {
+export function environmentTransportLabel(
+  environment: EnvironmentPresentation,
+  activeTarget: ConnectionTarget | null = null,
+): string {
   const { entry } = environment;
   if (entry.target._tag === "PrimaryConnectionTarget") return "This machine";
+  const routes = connectionRoutes(entry);
+  if (routes.length > 1) {
+    const active =
+      activeTarget === null
+        ? undefined
+        : routes.find(
+            (route) => connectionRouteId(route.target) === connectionRouteId(activeTarget),
+          );
+    return active === undefined
+      ? connectionRouteLabel(routes[0]!)
+      : `via ${connectionRouteLabel(active)}`;
+  }
   if (environment.relayManaged) return "T3 Connect";
   if (isDesktopLocalConnectionTarget(entry.target)) return "WSL";
   if (
@@ -31,16 +48,12 @@ export function environmentTransportLabel(environment: EnvironmentPresentation):
   return environment.displayUrl ?? "Remote link";
 }
 
-/**
- * One machine in a grouped settings list: icon, name, a single subtitle line,
- * and controls on the right. Every environment list on the Connections page
- * uses this so the lists share one rhythm.
- */
 export function EnvironmentRow({
   kind,
   label,
   subtitle,
   below,
+  detail,
   dimmed = false,
   className,
   children,
@@ -48,8 +61,8 @@ export function EnvironmentRow({
   readonly kind: EnvironmentMachineKind;
   readonly label: string;
   readonly subtitle: ReactNode;
-  /** Extra content under the subtitle, such as update progress. */
   readonly below?: ReactNode;
+  readonly detail?: ReactNode;
   readonly dimmed?: boolean;
   readonly className?: string;
   readonly children?: ReactNode;
@@ -69,6 +82,7 @@ export function EnvironmentRow({
         {below}
       </div>
       <div className="flex shrink-0 items-center gap-1">{children}</div>
+      {detail ? <div className="col-span-2 col-start-2 min-w-0">{detail}</div> : null}
     </div>
   );
 }

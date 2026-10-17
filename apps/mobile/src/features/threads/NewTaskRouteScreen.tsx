@@ -1,32 +1,49 @@
-import { MaterialListRow } from "../../components/MaterialListRow";
-import { ScreenHeader } from "../../components/ScreenHeader";
+import * as Dialog from "../../components/ui/Dialog";
+import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
+import { NavigationRow } from "../../components/ui/NavigationRow";
+import { AppBar } from "../../components/ui/AppBar";
 import {
   StackActions,
   useIsFocused,
   useNavigation,
   type StaticScreenProps,
 } from "@react-navigation/native";
-import { SymbolView } from "../../components/AppSymbol";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { availableScratchWorkspaceRoot } from "@t3tools/client-runtime/operations/projects";
+import { isScratchProject } from "@t3tools/client-runtime/state/projects";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Platform, Pressable, View } from "react-native";
+import { Platform, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { cn } from "../../lib/cn";
-import { MaterialScreenContent } from "../../components/MaterialScreenContent";
-import { MaterialButton } from "../../components/MaterialButton";
-import { ScreenScrollView as ScrollView } from "../../components/ScreenScrollView";
-import { AppText as Text } from "../../components/AppText";
+import { ScreenContent } from "../../components/ui/ScreenContent";
+import { Button } from "../../components/ui/Button";
+import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
+import { AppText as Text } from "../../components/ui/AppText";
 import { ProjectFavicon } from "../../components/ProjectFavicon";
-import { useProjects } from "../../state/entities";
+import { useProjects, useServerConfigs } from "../../state/entities";
+import { projectEnvironment } from "../../state/projects";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import type { WorkspaceState } from "../../state/workspaceModel";
 import { useWorkspaceState } from "../../state/workspace";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
+import { usePromptLinkResolver } from "../prompt-links/usePromptLinkResolver";
 import { useIncomingShare } from "../sharing/IncomingShareProvider";
 import { useNewTaskFlow } from "./new-task-flow-provider";
 import { filterProjectScopes, getProjectScopeSelectionTarget } from "./new-task-project-selection";
 
 type NewTaskRouteParams = {
   readonly incomingShareId?: string | string[];
+  readonly prompt?: string | string[];
+  readonly repo?: string | string[];
+  readonly pr?: string | string[];
+  readonly provider?: string | string[];
+  readonly model?: string | string[];
 };
 
 function deriveProjectEmptyState(catalogState: WorkspaceState): {
@@ -94,7 +111,7 @@ function NewTaskHeader(props: {
   const navigation = useNavigation();
   const { layout } = useAdaptiveWorkspaceLayout();
   return (
-    <ScreenHeader
+    <AppBar
       title={props.title}
       subtitle={props.subtitle ?? undefined}
       sidebar={false}
@@ -134,6 +151,7 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
   const isFocused = useIsFocused();
   const insets = useSafeAreaInsets();
   const { getShare, releaseShareReservation } = useIncomingShare();
+  usePromptLinkResolver(route.params);
   const routeShareId = Array.isArray(route.params?.incomingShareId)
     ? route.params.incomingShareId[0]
     : route.params?.incomingShareId;
@@ -147,7 +165,14 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
     : null;
   const screenTitle = incomingShare ? "Start a task" : "Choose project";
   const projectEmptyState = deriveProjectEmptyState(catalogState);
-  const visibleScopes = filterProjectScopes(projectScopes, searchText);
+  const serverConfigs = useServerConfigs();
+  const listScopes = projectScopes.filter(
+    (scope) =>
+      !scope.projects.every((project) =>
+        isScratchProject(project, serverConfigs.get(project.environmentId)?.scratchWorkspaceRoot),
+      ),
+  );
+  const visibleScopes = filterProjectScopes(listScopes, searchText);
   const resumedDestinationKeyRef = useRef<string | null>(null);
   const reservedDestinationProject = incomingShare?.destination
     ? (projects.find(
@@ -156,13 +181,32 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
           project.id === incomingShare.destination?.projectId,
       ) ?? null)
     : null;
+  const { connectedEnvironments } = useRemoteConnectionStatus();
+  const openScratch = useAtomCommand(projectEnvironment.openScratch, {
+    reportFailure: false,
+  });
+  const scratchEnvironments = connectedEnvironments.filter(
+    (environment) =>
+      availableScratchWorkspaceRoot(
+        environment.connectionState,
+        serverConfigs.get(environment.environmentId),
+      ) !== null,
+  );
+  const scratchEnvironment =
+    scratchEnvironments.find(
+      (environment) => environment.environmentId === selectedEnvironmentId,
+    ) ??
+    scratchEnvironments[0] ??
+    null;
+  const canStartScratch = scratchEnvironment !== null && reservedDestinationProject === null;
+  const scratchStartInFlightRef = useRef(false);
 
   async function selectProject(project: EnvironmentProject): Promise<void> {
     if (incomingShare?.destination && !reservedDestinationProject) {
       try {
         await releaseShareReservation(incomingShare.id, incomingShare.destination);
       } catch (error) {
-        Alert.alert(
+        Dialog.alert(
           "Could not change project",
           error instanceof Error
             ? error.message
@@ -187,6 +231,30 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
         incomingShareId: incomingShare?.id,
       }),
     );
+  }
+
+  async function startScratch(): Promise<void> {
+    if (!scratchEnvironment || scratchStartInFlightRef.current) return;
+    const environmentId = scratchEnvironment.environmentId;
+    scratchStartInFlightRef.current = true;
+    try {
+      const result = await openScratch({ environmentId, input: {} });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          Dialog.alert(
+            "Could not start without a project",
+            error instanceof Error
+              ? error.message
+              : "The folder for threads without a project could not be created.",
+          );
+        }
+        return;
+      }
+      await selectProject(result.value);
+    } finally {
+      scratchStartInFlightRef.current = false;
+    }
   }
 
   useEffect(() => {
@@ -229,7 +297,7 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
         onSearchTextChange={setSearchText}
       />
 
-      <MaterialScreenContent>
+      <ScreenContent>
         <ScrollView
           contentInsetAdjustmentBehavior="automatic"
           showsVerticalScrollIndicator={false}
@@ -246,16 +314,66 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
               : {}),
           }}
         >
-          {projectScopes.length === 0 ? (
+          {canStartScratch && listScopes.length > 0 ? (
+            Platform.OS === "android" ? (
+              <View collapsable={false} className="overflow-hidden rounded-[28px] bg-grouped-card">
+                <NavigationRow
+                  className="bg-grouped-card"
+                  title="No project"
+                  subtitle="Start a task without a project"
+                  onPress={() => void startScratch()}
+                  leading={
+                    <SymbolView
+                      name="text.bubble"
+                      size={22}
+                      tintColorClassName="accent-icon-muted"
+                      type="monochrome"
+                    />
+                  }
+                />
+              </View>
+            ) : (
+              <View collapsable={false} className="overflow-hidden rounded-[24px] bg-grouped-card">
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="No project"
+                  onPress={() => void startScratch()}
+                  className="flex-row items-center gap-3 bg-grouped-card px-4 py-3.5"
+                >
+                  <View className="h-7 w-7 items-center justify-center">
+                    <SymbolView
+                      name="text.bubble"
+                      size={18}
+                      tintColorClassName="accent-icon-muted"
+                      type="monochrome"
+                    />
+                  </View>
+                  <View className="min-w-0 flex-1">
+                    <Text className="text-base font-t3-bold leading-snug">No project</Text>
+                    <Text className="text-xs leading-snug text-foreground-muted" numberOfLines={1}>
+                      Start a task without a project
+                    </Text>
+                  </View>
+                  <SymbolView
+                    name="chevron.right"
+                    size={14}
+                    tintColorClassName="accent-chevron"
+                    type="monochrome"
+                  />
+                </Pressable>
+              </View>
+            )
+          ) : null}
+          {listScopes.length === 0 ? (
             <View
               collapsable={false}
               className={cn(
                 "items-center gap-3 px-6 py-8",
-                Platform.OS !== "android" && "rounded-[24px] bg-card",
+                Platform.OS !== "android" && "rounded-[24px] bg-grouped-card",
               )}
             >
               {projectEmptyState.loading ? (
-                <ActivityIndicator colorClassName="accent-icon-muted" />
+                <AppActivityIndicator colorClassName="accent-icon-muted" />
               ) : null}
               <Text className="text-center text-lg font-t3-bold text-foreground">
                 {projectEmptyState.title}
@@ -264,15 +382,24 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                 {projectEmptyState.detail}
               </Text>
               {Platform.OS === "android" ? (
-                <MaterialButton
-                  label={catalogState.hasReadyEnvironment ? "Add new project" : "Add environment"}
-                  tone="primary"
-                  onPress={() =>
-                    catalogState.hasReadyEnvironment
-                      ? navigation.dispatch(StackActions.push("AddProject"))
-                      : navigation.navigate("ConnectionsNew")
-                  }
-                />
+                <>
+                  <Button
+                    label={catalogState.hasReadyEnvironment ? "Add new project" : "Add environment"}
+                    tone="primary"
+                    onPress={() =>
+                      catalogState.hasReadyEnvironment
+                        ? navigation.dispatch(StackActions.push("AddProject"))
+                        : navigation.navigate("ConnectionsNew")
+                    }
+                  />
+                  {canStartScratch ? (
+                    <Button
+                      label="Start without a project"
+                      tone="secondary"
+                      onPress={() => void startScratch()}
+                    />
+                  ) : null}
+                </>
               ) : !catalogState.hasReadyEnvironment ? (
                 <Pressable
                   className="mt-1 rounded-full bg-primary px-4 py-2.5 active:opacity-70"
@@ -283,14 +410,26 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                   </Text>
                 </Pressable>
               ) : (
-                <Pressable
-                  className="mt-1 rounded-full bg-primary px-4 py-2.5 active:opacity-70"
-                  onPress={() => navigation.dispatch(StackActions.push("AddProject"))}
-                >
-                  <Text className="text-sm font-t3-bold text-primary-foreground">
-                    Add new project
-                  </Text>
-                </Pressable>
+                <>
+                  <Pressable
+                    className="mt-1 rounded-full bg-primary px-4 py-2.5 active:opacity-70"
+                    onPress={() => navigation.dispatch(StackActions.push("AddProject"))}
+                  >
+                    <Text className="text-sm font-t3-bold text-primary-foreground">
+                      Add new project
+                    </Text>
+                  </Pressable>
+                  {canStartScratch ? (
+                    <Pressable
+                      className="rounded-full bg-subtle px-4 py-2.5 active:opacity-70"
+                      onPress={() => void startScratch()}
+                    >
+                      <Text className="text-sm font-t3-bold text-foreground">
+                        Start without a project
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </>
               )}
             </View>
           ) : visibleScopes.length === 0 ? (
@@ -307,8 +446,8 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
               collapsable={false}
               className={
                 Platform.OS === "android"
-                  ? "overflow-hidden rounded-[28px] bg-card"
-                  : "overflow-hidden rounded-[24px] bg-card"
+                  ? "overflow-hidden rounded-[28px] bg-grouped-card"
+                  : "overflow-hidden rounded-[24px] bg-grouped-card"
               }
             >
               {visibleScopes.map((scope, scopeIndex) => {
@@ -319,7 +458,8 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                 );
                 if (Platform.OS === "android") {
                   return (
-                    <MaterialListRow
+                    <NavigationRow
+                      className="bg-grouped-card"
                       key={scope.key}
                       title={scope.title}
                       subtitle={
@@ -327,6 +467,8 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                           ? `${scope.projects.length} workspaces`
                           : selectionTarget.workspaceRoot
                       }
+                      subtitleNumberOfLines={1}
+                      subtitleEllipsizeMode="middle"
                       disabled={reservedDestinationProject !== null}
                       onPress={() => void selectProject(selectionTarget)}
                       leading={
@@ -352,7 +494,7 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                       accessibilityLabel={scope.title}
                       disabled={reservedDestinationProject !== null}
                       onPress={() => void selectProject(selectionTarget)}
-                      className="flex-row items-center gap-3 bg-card px-4 py-3.5"
+                      className="flex-row items-center gap-3 bg-grouped-card px-4 py-3.5"
                     >
                       <View className="h-7 w-7 items-center justify-center">
                         <ProjectFavicon
@@ -391,7 +533,7 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
             </View>
           )}
         </ScrollView>
-      </MaterialScreenContent>
+      </ScreenContent>
     </View>
   );
 }

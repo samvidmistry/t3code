@@ -70,6 +70,12 @@ export interface ComposerEditorProps {
    * hardware Return handling.
    */
   readonly enterBehavior?: ComposerEnterBehavior;
-  /** Hardware keyboard submission: Command-Return, or Return when `enterBehavior` is "send". */
-  readonly onSubmit?: () => void;
+  readonly submitTitle?: string;
+  readonly alternateSubmitTitle?: string;
+  /**
+   * `alternate` is true for the Command-modified chord, which sends using the
+   * opposite of the configured follow-up behavior. Always false on Android,
+   * which has no hardware Return handling.
+   */
+  readonly onSubmit?: (alternate: boolean) => void;
 }

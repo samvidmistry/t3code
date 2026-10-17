@@ -3,12 +3,20 @@ import { useRoute, type RouteProp } from "@react-navigation/native";
 import { useMemo, useRef, useState } from "react";
 import {
   EnvironmentId,
-  type OrchestrationThread,
   ThreadId,
+  type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadShell,
   type ScopedProjectRef,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
-import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import {
+  presentThreadShell,
+  type EnvironmentThreadShell,
+} from "@t3tools/client-runtime/state/shell";
+import {
+  deriveLatestThreadRun,
+  deriveThreadRuntime,
+} from "@t3tools/client-runtime/state/thread-execution";
 import * as Option from "effect/Option";
 
 import { scopedThreadKey } from "../lib/scopedEntities";
@@ -31,16 +39,15 @@ type ThreadSelectionRouteParams = {
 };
 
 function firstRouteParam(value: string | string[] | undefined): string | null {
-  if (Array.isArray(value)) {
-    return value[0] ?? null;
-  }
-
-  return value ?? null;
+  const first = Array.isArray(value) ? value[0] : value;
+  return first === undefined || first.trim().length === 0 ? null : first;
 }
 
-function latestUserMessageAt(thread: OrchestrationThread): OrchestrationThread["updatedAt"] | null {
-  for (let index = thread.messages.length - 1; index >= 0; index -= 1) {
-    const message = thread.messages[index];
+function latestUserMessageAt(
+  projection: OrchestrationV2ThreadProjection,
+): OrchestrationV2ThreadShell["latestUserMessageAt"] {
+  for (let index = projection.messages.length - 1; index >= 0; index -= 1) {
+    const message = projection.messages[index];
     if (message?.role === "user") {
       return message.createdAt;
     }
@@ -51,13 +58,18 @@ function latestUserMessageAt(thread: OrchestrationThread): OrchestrationThread["
 
 function threadDetailToShell(
   environmentId: EnvironmentId,
-  thread: OrchestrationThread,
+  projection: OrchestrationV2ThreadProjection,
 ): EnvironmentThreadShell {
-  return {
-    environmentId,
+  const thread = projection.thread;
+  const latestRun = deriveLatestThreadRun(projection);
+  const runtime = deriveThreadRuntime(projection);
+  const pendingRequest =
+    projection.runtimeRequests.find((request) => request.status === "pending") ?? null;
+  return presentThreadShell(environmentId, {
     id: thread.id,
     projectId: thread.projectId,
     title: thread.title,
+    providerInstanceId: thread.providerInstanceId,
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,
@@ -66,7 +78,23 @@ function threadDetailToShell(
     linkedPullRequest: thread.linkedPullRequest ?? null,
     pullRequests: thread.pullRequests,
     branchPullRequest: thread.branchPullRequest ?? null,
-    latestTurn: thread.latestTurn,
+    activeProviderThreadId: thread.activeProviderThreadId,
+    lineage: thread.lineage,
+    forkedFrom: thread.forkedFrom,
+    createdBy: thread.createdBy,
+    creationSource: thread.creationSource,
+    latestRunId: latestRun?.runId ?? null,
+    activeRunId: runtime?.activeRunId ?? null,
+    status: runtime?.status ?? "idle",
+    pendingRuntimeRequest:
+      pendingRequest === null
+        ? null
+        : { id: pendingRequest.id, kind: pendingRequest.kind, createdAt: pendingRequest.createdAt },
+    latestVisibleMessage: null,
+    latestUserMessageAt: latestUserMessageAt(projection),
+    hasActionableProposedPlan: false,
+    itemCount: projection.turnItems.length,
+    visibleItemCount: projection.visibleTurnItems.length,
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt,
     archivedAt: thread.archivedAt,
@@ -79,12 +107,8 @@ function threadDetailToShell(
     pinOrderKey: thread.pinOrderKey,
     snoozedUntil: thread.snoozedUntil ?? null,
     snoozedAt: thread.snoozedAt ?? null,
-    session: thread.session,
-    latestUserMessageAt: latestUserMessageAt(thread),
-    hasPendingApprovals: false,
-    hasPendingUserInput: false,
-    hasActionableProposedPlan: false,
-  };
+    deletedAt: thread.deletedAt,
+  });
 }
 
 function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefined) {
@@ -113,8 +137,6 @@ function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefin
       : scopedThreadKey(selectedThreadRef.environmentId, selectedThreadRef.threadId);
   const queuedMessagesByThreadKey = useThreadOutboxMessages();
   const creationOutcome = useAtomValue(pendingThreadCreationOutcomesAtom);
-  // A creation the outbox still holds or just delivered: the thread screen
-  // opened before the server made the thread, so present a stand-in shell.
   const pendingCreation = useMemo<PendingThreadCreation | null>(() => {
     if (selectedThreadKey === null) {
       return null;
@@ -127,16 +149,20 @@ function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefin
     return message === null ? null : { message, outcome };
   }, [creationOutcome, queuedMessagesByThreadKey, selectedThreadKey]);
   // Until the creation is delivered the server has no thread to subscribe
-  // to; subscribing anyway would retry "not found" for the whole setup.
+  // to. Every detail reader must use this ref, not the route id: an earlier
+  // read gets a definitive not-found, which the thread state keeps as deleted.
   const selectedThreadDetailRef =
     selectedThreadShell !== null ||
     pendingCreation === null ||
     pendingCreation.outcome?.kind === "delivered"
       ? selectedThreadRef
       : null;
+  const [previousCreation, setPreviousCreation] = useState<PendingThreadCreation | null>(null);
+  const needsDetail =
+    selectedThreadShell === null || pendingCreation !== null || previousCreation !== null;
   const selectedThreadDetailState = useEnvironmentThread(
-    selectedThreadDetailRef?.environmentId ?? null,
-    selectedThreadDetailRef?.threadId ?? null,
+    needsDetail ? (selectedThreadDetailRef?.environmentId ?? null) : null,
+    needsDetail ? (selectedThreadDetailRef?.threadId ?? null) : null,
   );
   const selectedThreadDetail = Option.getOrNull(selectedThreadDetailState.data);
   const selectedThread = useMemo(
@@ -149,7 +175,6 @@ function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefin
           : null),
     [pendingCreation, selectedThreadDetail, selectedThreadRef, selectedThreadShell],
   );
-  const [previousCreation, setPreviousCreation] = useState<PendingThreadCreation | null>(null);
   const selectedThreadCreation = resolvePendingThreadCreation({
     threadKey: selectedThreadKey,
     pending: pendingCreation,
@@ -179,7 +204,7 @@ function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefin
       selectedThreadRef,
       selectedThread,
       selectedThreadCreation,
-      selectedThreadDetailState,
+      selectedThreadDetailRef,
       selectedThreadProject,
       selectedEnvironmentConnection,
       selectedEnvironmentRuntime,
@@ -189,7 +214,7 @@ function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefin
       selectedEnvironmentRuntime,
       selectedThread,
       selectedThreadCreation,
-      selectedThreadDetailState,
+      selectedThreadDetailRef,
       selectedThreadProject,
       selectedThreadRef,
     ],

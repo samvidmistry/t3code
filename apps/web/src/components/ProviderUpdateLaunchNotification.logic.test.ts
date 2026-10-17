@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
-  type EnvironmentId,
+  EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 
 import {
   buildLocalEnvironmentUpdateGroups,
@@ -21,6 +21,7 @@ import {
   getProviderUpdateInitialToastView,
   getProviderUpdateProgressToastView,
   getProviderUpdateRejectedToastView,
+  getProviderUpdateRunToastView,
   getProviderUpdateSidebarPillView,
   hasOneClickUpdateProviderCandidate,
   isProviderUpdateCandidate,
@@ -923,12 +924,6 @@ describe("provider update launch notification logic", () => {
     });
 
     it("treats running/initial as non-terminal so they are not persisted", () => {
-      // The per-environment update row uses this to decide what to store. A
-      // "running"/"initial" snapshot never re-polls, so persisting it would pin
-      // the row's spinner forever once pending clears (see the
-      // resolveEnvironmentUpdateRowStatus "keeps a non-terminal result on
-      // loading even after pending clears" case). Dropping these lets the live
-      // per-environment provider state drive the row so it self-heals.
       expect(isTerminalProviderUpdatePhase("running")).toBe(false);
       expect(isTerminalProviderUpdatePhase("initial")).toBe(false);
     });
@@ -987,8 +982,6 @@ describe("provider update launch notification logic", () => {
     });
 
     it("falls through a non-terminal result to live server state", () => {
-      // The dispatch snapshot is still "running", but server state already
-      // reports success — the row must not stay pinned on "Updating…".
       expect(
         resolveEnvironmentUpdateRowStatus({
           group,
@@ -1013,8 +1006,6 @@ describe("provider update launch notification logic", () => {
     });
 
     it("keeps a non-terminal result on loading even after pending clears", () => {
-      // The dispatch returned an incomplete ("running") snapshot and pending was
-      // cleared in finally — the row must not revert to the idle Update button.
       expect(
         resolveEnvironmentUpdateRowStatus({
           group,
@@ -1057,4 +1048,92 @@ it("does not offer incompatible latest versions and restores suggestions after p
     expect(isProviderUpdateCandidate(snapshot)).toBe(expected);
     expect(isProviderSettingsUpdateCandidate(snapshot)).toBe(expected);
   }
+});
+
+describe("getProviderUpdateRunToastView", () => {
+  const updateState = (
+    status: "succeeded" | "failed",
+    message: string,
+  ): ServerProvider["updateState"] => ({
+    status,
+    startedAt: checkedAt,
+    finishedAt: laterCheckedAt,
+    message,
+    output: null,
+  });
+  const run = (
+    machineLabel: string,
+    providerDriver: string,
+    result: Parameters<typeof getProviderUpdateRunToastView>[0][number]["result"],
+  ) => ({
+    environmentId: EnvironmentId.make(machineLabel),
+    machineLabel,
+    driver: driver(providerDriver),
+    instanceId: instanceId(providerDriver),
+    result,
+  });
+
+  it("lists every failed update and ignores interrupted ones", () => {
+    const view = getProviderUpdateRunToastView([
+      run(
+        "Mac Studio",
+        "codex",
+        AsyncResult.success({
+          providers: [
+            provider({
+              driver: driver("codex"),
+              updateState: updateState("succeeded", "Provider updated."),
+            }),
+          ],
+        }),
+      ),
+      run(
+        "Mac Studio",
+        "claudeAgent",
+        AsyncResult.success({
+          providers: [
+            provider({
+              driver: driver("claudeAgent"),
+              updateState: updateState("failed", "npm exited with code 1."),
+            }),
+          ],
+        }),
+      ),
+      run("Laptop", "codex", AsyncResult.failure(Cause.die(new Error("WebSocket closed")))),
+      run("Server", "codex", AsyncResult.failure(Cause.interrupt())),
+    ]);
+
+    expect(view).toEqual({
+      type: "error",
+      title: "2 of 3 provider updates failed",
+      description: "Mac Studio · Claude: npm exited with code 1.\nLaptop · Codex: WebSocket closed",
+    });
+  });
+
+  it("reports success when every update succeeded", () => {
+    const succeeded = AsyncResult.success({
+      providers: [
+        provider({
+          driver: driver("codex"),
+          updateState: updateState("succeeded", "Provider updated."),
+        }),
+      ],
+    });
+
+    expect(
+      getProviderUpdateRunToastView([
+        run("Mac Studio", "codex", succeeded),
+        run("Laptop", "codex", succeeded),
+      ]),
+    ).toEqual({
+      type: "success",
+      title: "2 providers updated",
+      description: "New sessions will use the updated providers.",
+    });
+    expect(
+      getProviderUpdateRunToastView([
+        run("Server", "codex", AsyncResult.failure(Cause.interrupt())),
+      ]),
+    ).toBeNull();
+  });
 });

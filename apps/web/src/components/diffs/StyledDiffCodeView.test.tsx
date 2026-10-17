@@ -13,7 +13,6 @@ import {
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
   type Ref,
@@ -39,7 +38,6 @@ vi.mock("@pierre/diffs/worker/worker.js?worker", async () => {
   const { Worker } = await import("node:worker_threads");
   const moduleUrl = import.meta.resolve("@pierre/diffs/worker/worker.js");
 
-  // Adapt only the transport. Pierre's real worker loads its WASM and produces every response.
   return {
     default: class {
       worker: NodeWorkerThreads.Worker;
@@ -98,7 +96,7 @@ vi.mock("@pierre/diffs/worker/worker.js?worker", async () => {
 
 vi.mock("@pierre/diffs/react", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@pierre/diffs/react")>()),
-  CodeView: (props: CodeViewProps) => {
+  CodeView: (props: CodeViewProps<undefined, undefined>) => {
     return props.items?.map((item) =>
       item.type === "file" ? <FileOutput key={item.id} file={item.file} /> : null,
     );
@@ -115,6 +113,7 @@ function FileOutput({ file }: { file: FileContents }) {
     testState.renderPools.push(pool);
     const renderer = new FileRenderer(
       { theme: "pierre-dark", preferredHighlighter: "shiki-wasm" },
+      undefined,
       render,
       pool,
     );
@@ -301,8 +300,10 @@ describe("code-view worker lifecycle", () => {
     expect(pool.getStats().totalWorkers).toBe(2);
     expect(testState.terminations).toHaveLength(0);
     await act(async () => renderer!.update(renderViews(0)));
+    // Pierre gives up on a held startup after 10 seconds; the idle timer then tears the pool down.
+    const timedOut = expect(pending).rejects.toThrow("worker initialization timed out");
     await vi.advanceTimersByTimeAsync(30_000);
-    await pending;
+    await timedOut;
     await Promise.all(testState.terminations);
     await act(async () => {
       for (const deliver of testState.heldResponses) deliver();
@@ -339,7 +340,8 @@ function RevealViewer({
       instance.current = undefined;
     };
   }, [collapsed]);
-  const handle = useMemo(
+  useImperativeHandle(
+    viewerRef,
     () => ({
       getInstance: () => instance.current,
       scrollTo: (target: CodeViewScrollTarget) => {
@@ -354,7 +356,6 @@ function RevealViewer({
     }),
     [scope],
   );
-  useImperativeHandle(viewerRef, () => handle, [handle]);
   return null;
 }
 
@@ -371,12 +372,33 @@ function RevealViews({
 }) {
   const [viewer, setViewer] = useState<RevealHandle | null>(null);
   const [collapsed, setCollapsed] = useState(true);
-  const selectedRequest = useMemo(() => ({ selectedFile, requestId }), [requestId, selectedFile]);
+  // The reveal hook cancels pending clicks by scope identity, so a scope object
+  // must only be replaced when one of its inputs changes.
+  const [storedRevealScope, setRevealScope] = useState(() => ({
+    scope,
+    selectedRequest: { selectedFile, requestId },
+  }));
+  let revealScope = storedRevealScope;
+  if (
+    revealScope.scope !== scope ||
+    revealScope.selectedRequest.selectedFile !== selectedFile ||
+    revealScope.selectedRequest.requestId !== requestId
+  ) {
+    revealScope = {
+      scope,
+      selectedRequest:
+        revealScope.selectedRequest.selectedFile === selectedFile &&
+        revealScope.selectedRequest.requestId === requestId
+          ? revealScope.selectedRequest
+          : { selectedFile, requestId },
+    };
+    setRevealScope(revealScope);
+  }
+  const { selectedRequest } = revealScope;
   useEffect(() => {
     if (!selectedRequest.selectedFile || !viewer?.getInstance()) return;
     viewer.scrollTo({ type: "item", id: selectedRequest.selectedFile, align: "start" });
   }, [selectedRequest, viewer]);
-  const revealScope = useMemo(() => ({ scope, selectedRequest }), [scope, selectedRequest]);
   const requestReveal = useCodeViewFileReveal(viewer, revealScope);
   return (
     <>

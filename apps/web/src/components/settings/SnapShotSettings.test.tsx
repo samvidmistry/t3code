@@ -20,11 +20,18 @@ vi.mock("react", async (original) => {
     useEffect: (effect: () => void) => effects.push(effect),
   };
 });
+vi.mock("../../hooks/useStableCallback", () => ({
+  useStableCallback: <F,>(fn: F) => fn,
+}));
 vi.mock("react/compiler-runtime", async () => {
   const { reactHookHarness } = await import("../../test/reactHookHarness");
   return { c: reactHookHarness.useMemoCache };
 });
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => [] }));
+vi.mock("../../state/environments", () => ({
+  usePrimaryEnvironmentId: () => null,
+  useEnvironments: () => [],
+}));
 vi.mock("../../state/server", () => ({ primaryServerKeybindingsAtom: {} }));
 vi.mock("./SettingsScopeContext", () => ({ useOptionalSettingsScope: () => null }));
 vi.mock("./SettingsScopeSentence", () => ({ SettingsScopeSentence: () => null }));

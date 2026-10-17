@@ -54,10 +54,6 @@ const PROJECT_SCRIPTS = JSON.stringify([
 const SHOWCASE_TERMINAL_PROMPT =
   "\u001b[1;32m→\u001b[0m \u001b[1;36mt3code\u001b[0m \u001b[1;34mgit:(\u001b[1;31mfeat/remote-command-center\u001b[1;34m)\u001b[0m \u001b[1;33m✗\u001b[0m ";
 
-// A dev-server startup mirroring the web settings' terminal font preview:
-// zsh-style prompt, brand line, addresses, the thread's 612-test summary,
-// and a READY badge, so the scene exercises bold, dim, underline, the six
-// accent colors, and a background cell.
 export const SHOWCASE_TERMINAL_BUFFER = [
   `${SHOWCASE_TERMINAL_PROMPT}vpr dev`,
   "",
@@ -230,10 +226,6 @@ export const SHOWCASE_THREADS = [
       "Delayed work now carries a concise reason through the trace, so the wait is legible without changing scheduling behavior.",
     snoozeMinutes: 8 * 60,
   },
-  // Finished work, settled by hand: the list keeps it as a receded tail so
-  // the active block above reads as everything still in flight. The active
-  // block stays small enough that the settled tail begins above the fold —
-  // a store screenshot has to show that history exists, not just imply it.
   {
     id: "handoff-haptics",
     projectId: "t3code",
@@ -427,7 +419,11 @@ function insertThread(
     .run(input.id, isWorking ? "running" : "ready", isWorking ? turnId : null, updatedAt);
 }
 
-const SEEDED_PROJECTION_TABLES = [
+// V1 tables this seed owns. `projection_projects` is not listed: V2 still
+// stores projects there, so the seed upserts its own rows instead. V2 clients
+// do not read the V1 thread rows; moving the seed to V2 is tracked in
+// https://github.com/pingdotgg/t3code/issues/15013.
+const SEEDED_V1_TABLES = [
   "projection_pending_approvals",
   "projection_thread_proposed_plans",
   "projection_thread_activities",
@@ -435,9 +431,10 @@ const SEEDED_PROJECTION_TABLES = [
   "projection_thread_sessions",
   "projection_turns",
   "projection_threads",
-  "projection_projects",
   "projection_state",
 ] as const;
+
+const SEEDED_PROJECTION_TABLES = [...SEEDED_V1_TABLES, "projection_projects"] as const;
 
 const SEEDED_THREAD_COLUMNS = ["snoozed_until", "snoozed_at"] as const;
 
@@ -491,11 +488,11 @@ function seedDatabase(
   const database = new NodeSqlite.DatabaseSync(dbPath, { timeout: 30_000 });
   try {
     database.exec("BEGIN IMMEDIATE");
-    for (const table of SEEDED_PROJECTION_TABLES) {
+    for (const table of SEEDED_V1_TABLES) {
       database.exec(`DELETE FROM ${table}`);
     }
     const insertProject = database.prepare(
-      `INSERT INTO projection_projects (
+      `INSERT OR REPLACE INTO projection_projects (
           project_id, title, workspace_root, default_model_selection_json, scripts_json,
           created_at, updated_at, deleted_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
@@ -624,9 +621,7 @@ function seedDatabase(
     // replace the one that actually explains the failure.
     try {
       database.exec("ROLLBACK");
-    } catch {
-      // Nothing to roll back.
-    }
+    } catch {}
     throw error;
   } finally {
     database.close();
@@ -656,7 +651,7 @@ export async function seedShowcaseEnvironment(input: {
   if (!primaryProject) throw new Error("The primary showcase workspace is not configured.");
   const workspaceRoot = workspaceRoots.get(primaryProject.id);
   if (!workspaceRoot) throw new Error("The primary showcase workspace is not configured.");
-  const dbPath = NodePath.join(input.baseDir, "userdata", "state.sqlite");
+  const dbPath = NodePath.join(input.baseDir, "userdata", "statev2.sqlite");
   if (primaryProject.id === SHOWCASE_PROJECT_ID) {
     await seedT3CodeWorkspace(workspaceRoot);
   }

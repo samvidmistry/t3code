@@ -9,7 +9,7 @@ import * as Layer from "effect/Layer";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/process";
 
 import {
   buildWslRuntimeInstallScript,
@@ -35,8 +35,6 @@ const encoder = new TextEncoder();
 const REQUIRED_SHELL_TOOLS = ["flock", "sha256sum", "tar", "mktemp"] as const;
 
 const posixShellRunner = (() => {
-  // Candidates rather than a platform switch: wsl.exe simply fails to spawn
-  // where it does not exist, which is the same answer as a shell missing flock.
   const candidates = [
     { file: "bash", args: [] as ReadonlyArray<string> },
     { file: "wsl.exe", args: ["-e", "bash"] as ReadonlyArray<string> },
@@ -69,14 +67,31 @@ const runShell = (script: string) => {
 
 const sh = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
+const awaitHolder = (condition: string) =>
+  `i=0; until ${condition}; do i=$((i + 1)); [ "$i" -lt 500 ] || exit 1; sleep 0.01; done`;
+
+// Holds a cache busy the way a running server does: the holder's argv[0] is the
+// runtime entry, which the prune and install scripts look for in /proc cmdline.
+// It reads a pipe the script keeps open on fd 7, so it exits with the script
+// instead of outliving it on a timer.
+const holdRuntimeBusy = (entry: string) =>
+  [
+    `exec 7> >(exec -a ${entry} cat >/dev/null 2>&1)`,
+    awaitHolder(`grep -qF -- ${entry} /proc/[0-9]*/cmdline 2>/dev/null`),
+  ].join("\n");
+
+const holdInstallLock = (lock: string) =>
+  [
+    `exec 6> >(exec 9> ${lock}; flock -x 9; cat >/dev/null 2>&1)`,
+    awaitHolder(`! flock -n ${lock} true`),
+  ].join("\n");
+
 const readField = (stdout: string, field: string) => {
   const line = stdout.split("\n").find((candidate) => candidate.startsWith(`${field}:`));
   if (line === undefined) throw new Error(`missing ${field} in fixture output: ${stdout}`);
   return line.slice(field.length + 1).trim();
 };
 
-// Stands in for the release's self-contained `t3` executable: the install
-// script only asks it for `--version`.
 const SERVER_ENTRY_SOURCE = '#!/bin/sh\necho "t3code wsl runtime test server 0.0.0"\n';
 
 const makeDistroListSpawner = (result: { readonly stdout?: string; readonly exitCode?: number }) =>
@@ -207,8 +222,6 @@ describe("WSL runtime cache", () => {
     );
     expect(script).toContain(`if [ "$archive_sha" != '${expected}' ]; then`);
 
-    // A warm cache exits before the hash, so reuse never pays for it, and the
-    // mismatch check runs before anything mutates the cache.
     const readyShortCircuit = script.indexOf("if runtime_is_ready; then");
     const digestChecked = script.indexOf("archive_sha=$(sha256sum");
     const existingRuntimeMoved = script.indexOf('mv -T "$runtime_root" "$runtime_stale"');
@@ -218,11 +231,6 @@ describe("WSL runtime cache", () => {
     expect(extracted).toBeGreaterThan(digestChecked);
   });
 
-  // Invalidation revokes the ready marker without stopping the backend that
-  // failed the probe, so the next install can find an unready tree that a live
-  // process is still running out of. Deleting it there unlinks node_modules
-  // under that process; the pruner already refuses to touch in-use caches, and
-  // the install path has to refuse too.
   it("moves an in-use runtime aside instead of deleting it under a live backend", () => {
     const script = buildWslRuntimeInstallScript(
       "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
@@ -231,8 +239,6 @@ describe("WSL runtime cache", () => {
     );
 
     expect(script).toContain('grep -qF -- "$1/" /proc/[0-9]*/cmdline 2>/dev/null');
-    // No /proc means no way to tell, and guessing wrong costs a backend its
-    // runtime, so an unknowable answer has to count as in use.
     expect(script).toContain("  [ -d /proc/1 ] || return 0");
     expect(script).toContain('  if runtime_in_use "$runtime_root"; then');
 
@@ -243,9 +249,6 @@ describe("WSL runtime cache", () => {
     expect(inUseChecked).toBeGreaterThan(-1);
     expect(inUseChecked).toBeLessThan(moved);
 
-    // In use: keep the tree and restart the sweep's clock, because renaming
-    // preserves the directory's mtime and a long-installed tree would otherwise
-    // already be past the age gate. Idle: delete it now, as before.
     const kept = script.indexOf('touch "$runtime_stale"');
     const deleted = script.indexOf('rm -rf "$runtime_stale"');
     expect(kept).toBeGreaterThan(moved);
@@ -259,13 +262,8 @@ describe("WSL runtime cache", () => {
       "b".repeat(64),
     );
 
-    // The same proof the SSH runner and CLI installers use: executable, and
-    // `--version` exits 0. That is what decides arch and loadability, so no
-    // separate native probe is needed.
     expect(script).toContain('  [ -x "$1/t3" ] && "$1/t3" --version >/dev/null 2>&1');
 
-    // Readiness gates the short-circuit, so a cache whose executable broke
-    // reinstalls from the archive instead of being reused forever.
     const entryCheckDefined = script.indexOf("runtime_entry_runs() {");
     const readinessDefined = script.indexOf("runtime_is_ready() {");
     const readyShortCircuit = script.indexOf("if runtime_is_ready; then");
@@ -274,9 +272,6 @@ describe("WSL runtime cache", () => {
     expect(readinessDefined).toBeLessThan(readyShortCircuit);
   });
 
-  // A swapped or half-written `t3` can still exist and even still answer
-  // `--version`, and launch then runs something this install never verified.
-  // The digest the install records is what turns that into a miss.
   it("re-hashes the executable against the digest the install recorded", () => {
     const script = buildWslRuntimeInstallScript(
       "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
@@ -288,14 +283,11 @@ describe("WSL runtime cache", () => {
     expect(script).toContain(
       '    [ "$recorded_entry_digest" = "$(runtime_server_entry_digest "$runtime_root")" ]',
     );
-    // A runtime installed before the marker carried a digest reads as empty,
-    // which has to be a miss rather than a pass.
     expect(script).toContain('    [ -n "$recorded_entry_digest" ] &&');
     expect(script).toContain(
       `printf '%s\\n' "$installed_entry_digest" > "$runtime_tmp/.t3code-wsl-runtime-ready"`,
     );
 
-    // The digest is recorded after extraction and before promotion.
     const extracted = script.indexOf("tar -xzf");
     const digestRecorded = script.indexOf(
       'installed_entry_digest=$(runtime_server_entry_digest "$runtime_tmp")',
@@ -316,8 +308,6 @@ describe("WSL runtime cache", () => {
 
     expect(script).toContain('if ! runtime_entry_runs "$runtime_tmp"; then');
 
-    // The extracted tree is rejected before the ready marker is written, so a
-    // defective archive falls back to the mounted tree instead of caching.
     const payloadValidated = script.indexOf('runtime_entry_runs "$runtime_tmp"');
     const markerWritten = script.indexOf('> "$runtime_tmp/.t3code-wsl-runtime-ready"');
     const promoted = script.indexOf('mv -T "$runtime_tmp" "$runtime_root"');
@@ -348,18 +338,11 @@ describe("WSL runtime cache", () => {
   it("never deletes a runtime another backend is running from", () => {
     const script = buildWslRuntimePruneScript("1.2.3/x64");
 
-    // The running backend's argv holds `<runtime>/t3`, so
-    // the process itself is the lease and exiting releases it. Nothing has to be
-    // registered up front, which is what makes this cover backends already
-    // running from an older version that knows nothing about pruning.
     expect(script).toContain('  grep -qF -- "$1/" /proc/[0-9]*/cmdline 2>/dev/null');
     expect(script).toContain('  ! runtime_in_use "$candidate" || continue');
 
-    // Without visible processes the retention rules cannot tell a live cache
-    // from an abandoned one, so the sweep is skipped rather than guessed at.
     expect(script).toContain("[ -d /proc/1 ] || exit 0");
 
-    // The guard has to gate the delete, not just exist.
     const inUseChecked = script.indexOf('! runtime_in_use "$candidate"');
     const removed = script.indexOf('rm -rf -- "$candidate"');
     expect(inUseChecked).toBeGreaterThan(-1);
@@ -369,31 +352,20 @@ describe("WSL runtime cache", () => {
   it("sweeps orphaned install scratch directories the ready-marker loops cannot see", () => {
     const script = buildWslRuntimePruneScript("1.2.3/x64");
 
-    // Dot-prefixed, so `"$runtime_parent"/*` never matches them, and they carry
-    // no ready marker either; without this pass a killed install leaks forever.
     expect(script).toContain(
       'for scratch in "$runtime_parent"/.*.tmp.* "$runtime_parent"/.*.stale.*; do',
     );
-    // Age guard: a scratch directory younger than this belongs to a live install.
     expect(script).toContain('find "$scratch" -maxdepth 0 -mmin +120');
   });
 
   it("invalidates a cache by dropping its ready marker, not the tree", () => {
     const script = buildWslRuntimeInvalidateScript("1.2.3/x64");
 
-    // Readiness is a presence check, so a tree whose pty.node is present but
-    // unloadable stays ready forever unless the probe can revoke the marker.
     expect(script).toContain('rm -f "$HOME/.t3/wsl-runtime/1.2.3_x64/.t3code-wsl-runtime-ready"');
-    // Deleting the tree here would pull it out from under any backend still
-    // running from it; the next install moves an unready root aside instead.
     expect(script).not.toContain("rm -rf");
   });
 });
 
-// Reading the generated script proves what it says, not what it does. A cache
-// whose entry was truncated satisfied every assertion above and still got
-// reused, so these run the real script against a real archive in a throwaway
-// HOME and check the outcome.
 describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed)", () => {
   const fixtures: Array<string> = [];
 
@@ -407,8 +379,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
       [
         "set -eu",
         "work=$(mktemp -d)",
-        // Mirrors the release archive: one top-level versioned directory that
-        // holds the executable and its native addons.
         'stage="$work/stage/t3-0.0.0-linux-x64"',
         'mkdir -p "$stage/node_modules/node-pty/build/Release" "$work/home"',
         `printf '%s' ${sh(SERVER_ENTRY_SOURCE)} > "$stage/t3"`,
@@ -452,8 +422,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
       [
         `export HOME=${sh(`${fixture.work}/home`)}`,
         'export NVM_DIR="$HOME/.nvm" FNM_DIR="$HOME/.fnm" VOLTA_HOME="$HOME/.volta"',
-        // Isolate login profiles and hide the host's Node/version managers.
-        // The resolver must discover the fixture's installation itself.
         "bash() { (",
         "  command() {",
         '    case "$*" in',
@@ -519,8 +487,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
   it("reuses a warm cache without touching the archive", () => {
     const fixture = createFixture();
     expect(fixture.install().status).toBe(0);
-    // Deleting the archive is how the test tells reuse apart from a silent
-    // reinstall: only the warm path can succeed without it.
     expect(runShell(`set -eu\nrm ${sh(fixture.archivePath)}`).status).toBe(0);
 
     const warm = fixture.install();
@@ -550,20 +516,12 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
 
     const broken = fixture.install();
 
-    // Non-zero with no runtimeRoot is what sends the backend to the mounted
-    // server tree. Exiting 0 here is the bug: launch would pick the zero-byte
-    // server, fail to become ready, and do it again on every restart.
     expect(broken.status).not.toBe(0);
     expect(parseWslRuntimeRoot(broken.stdout)).toBeNull();
   });
 
   it("extracts once when two installs race for the same cache", () => {
     const fixture = createFixture();
-    // A tar shim counts extractions and holds the critical section open long
-    // enough that the second install is certain to arrive while the first is
-    // still inside it. One extraction is the answer either way the runs
-    // interleave: whoever waits for the lock re-checks readiness before
-    // spending an extract, so a broken lock shows up as two.
     const raced = runShell(
       [
         "set -eu",
@@ -604,9 +562,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
 
   it("leaves no half-built cache when extraction fails", () => {
     const fixture = createFixture();
-    // Truncating the archive and re-recording its digest gets the install past
-    // the digest gate and into a tar that dies mid-stream, which is what a full
-    // disk or an interrupted write looks like from inside the distro.
     const truncated = runShell(
       [
         "set -eu",
@@ -625,21 +580,12 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
 
     expect(failed.status).not.toBe(0);
     expect(parseWslRuntimeRoot(failed.stdout)).toBeNull();
-    // A partial extract that survived under the cache name would be promoted by
-    // the next launch's readiness check; scratch that survived would sit there
-    // until the pruner's age sweep. Neither is left behind. Only directories
-    // are counted: the empty flock file stays on purpose, which is what keeps
-    // the lock from carrying stale state across a killed install.
     const leftovers = runShell(
       `set -eu\nfind ${sh(fixture.runtimeParent)} -mindepth 1 -maxdepth 1 -type d`,
     );
     expect(leftovers.stdout.trim()).toBe("");
   });
 
-  // The archive and the identity recorded beside it can diverge — a partial
-  // download, or a rebuilt archive dropped next to an older sidecar. Either
-  // gate firing means the bytes never reach the cache under a name that claims
-  // to describe something else.
   it("refuses an archive whose bytes do not match the digest recorded for it", () => {
     const fixture = createFixture();
 
@@ -712,9 +658,7 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
         `runtime_root=${sh(fixture.runtimeRoot)}`,
         `runtime_parent=${sh(fixture.runtimeParent)}`,
         'rm "$runtime_root/.t3code-wsl-runtime-ready"',
-        'sh -c "sleep 30" "$runtime_root/t3" >/dev/null 2>&1 &',
-        "active_pid=$!",
-        "sleep 0.1",
+        holdRuntimeBusy('"$runtime_root/t3"'),
         fixture.installScript(),
         'stale=$(find "$runtime_parent" -maxdepth 1 -type d -name ".sha256-*.stale.*" -print -quit)',
         'test -n "$stale"',
@@ -723,8 +667,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
         "export HOME",
         buildWslRuntimePruneScript(fixture.runtimeId),
         'test ! -e "$stale"',
-        "kill $active_pid",
-        "wait $active_pid 2>/dev/null || true",
       ].join("\n"),
     );
 
@@ -750,15 +692,8 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
         'touch -d "4 minutes ago" "$runtime_parent/sha256-active"',
         'touch -d "3 minutes ago" "$runtime_parent/sha256-old"',
         'touch -d "2 minutes ago" "$runtime_parent/sha256-locked"',
-        'sh -c "sleep 30" "$runtime_parent/sha256-active/t3" >/dev/null 2>&1 &',
-        "active_pid=$!",
-        "(",
-        '  exec 9> "$runtime_parent/.sha256-locked.install.lock"',
-        "  flock -x 9",
-        "  sleep 30",
-        ") >/dev/null 2>&1 &",
-        "lock_pid=$!",
-        "sleep 0.1",
+        holdRuntimeBusy('"$runtime_parent/sha256-active/t3"'),
+        holdInstallLock('"$runtime_parent/.sha256-locked.install.lock"'),
         `HOME="$home"`,
         "export HOME",
         buildWslRuntimePruneScript("sha256-current"),
@@ -769,9 +704,6 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
         'test -d "$runtime_parent/versions"',
         'test ! -e "$runtime_parent/sha256-old"',
         'test ! -e "$runtime_parent/sha256-markerless"',
-        "kill $active_pid $lock_pid",
-        "wait $active_pid 2>/dev/null || true",
-        "wait $lock_pid 2>/dev/null || true",
         'rm -rf "$work"',
       ].join("\n"),
     );
